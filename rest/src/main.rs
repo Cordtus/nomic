@@ -21,13 +21,15 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use ibc::clients::ics07_tendermint::client_state::ClientState;
-use ibc::core::ics24_host::identifier::ConnectionId as IbcConnectionId;
+use ibc::clients::tendermint::types::ClientState;
+use ibc::core::host::types::identifiers::ConnectionId as IbcConnectionId;
 use ibc_proto::google::protobuf::Any;
 use ibc_proto::ibc::core::client::v1::IdentifiedClientState;
 use ibc_proto::ibc::core::connection::v1::ConnectionEnd as RawConnectionEnd;
 use ibc_proto::ibc::lightclients::tendermint::v1::ClientState as RawTmClientState;
 
+use bech32::ToBase32;
+use sha2::Digest;
 use tendermint_proto::types::CommitSig as RawCommitSig;
 use tendermint_rpc as tm;
 use tm::Client as _;
@@ -64,13 +66,13 @@ async fn validators(status: Option<String>) -> Value {
         .await
         .unwrap();
 
+    let all_keys: Vec<_> = app_client()
+        .query(|app: InnerApp| app.staking.consensus_keys())
+        .await
+        .unwrap();
+
     let mut validators = vec![];
     for validator in all_validators {
-        let cons_key = app_client()
-            .query(|app: InnerApp| app.staking.consensus_key(validator.address.into()))
-            .await
-            .unwrap(); // TODO: cache
-
         let validator_status = if validator.unbonding {
             "BOND_STATUS_UNBONDING"
         } else if validator.in_active_set {
@@ -82,6 +84,12 @@ async fn validators(status: Option<String>) -> Value {
         if !status.is_none() && status != Some(validator_status.to_owned()) {
             continue;
         }
+
+        let cons_key = all_keys
+            .iter()
+            .find(|entry| (**entry).0 == validator.address.into())
+            .map(|entry| (*entry).1)
+            .unwrap();
 
         let info: DeclareInfo =
             serde_json::from_str(String::from_utf8(validator.info.to_vec()).unwrap().as_str())
@@ -215,12 +223,12 @@ async fn bank_balances(address: &str) -> Result<Value, BadRequest<String>> {
     let nom_balance: u64 = app_client()
         .query(|app| app.accounts.balance(address))
         .await
-        .map_err(|e| BadRequest(Some(format!("{:?}", e))))?
+        .map_err(|e| BadRequest(format!("{:?}", e)))?
         .into();
     let nbtc_balance: u64 = app_client()
         .query(|app| app.bitcoin.accounts.balance(address))
         .await
-        .map_err(|e| BadRequest(Some(format!("{:?}", e))))?
+        .map_err(|e| BadRequest(format!("{:?}", e)))?
         .into();
 
     Ok(json!({
@@ -248,7 +256,7 @@ async fn bank_balances_2(address: &str) -> Result<Value, BadRequest<String>> {
     let balance: u64 = app_client()
         .query(|app| app.accounts.balance(address))
         .await
-        .map_err(|e| BadRequest(Some(format!("{:?}", e))))?
+        .map_err(|e| BadRequest(format!("{:?}", e)))?
         .into();
 
     Ok(json!({
@@ -269,13 +277,13 @@ async fn auth_accounts(addr_str: &str) -> Result<Value, BadRequest<String>> {
     let balance: u64 = app_client()
         .query(|app| app.accounts.balance(address))
         .await
-        .map_err(|e| BadRequest(Some(format!("{:?}", e))))?
+        .map_err(|e| BadRequest(format!("{:?}", e)))?
         .into();
 
     let mut nonce: u64 = app_client()
         .query_root(|app| app.inner.inner.borrow().inner.inner.inner.nonce(address))
         .await
-        .map_err(|e| BadRequest(Some(format!("{:?}", e))))?;
+        .map_err(|e| BadRequest(format!("{:?}", e)))?;
     nonce += 1;
 
     Ok(json!({
@@ -303,13 +311,13 @@ async fn auth_accounts2(addr_str: &str) -> Result<Value, BadRequest<String>> {
     let _balance: u64 = app_client()
         .query(|app| app.accounts.balance(address))
         .await
-        .map_err(|e| BadRequest(Some(format!("{:?}", e))))?
+        .map_err(|e| BadRequest(format!("{:?}", e)))?
         .into();
 
     let mut nonce: u64 = app_client()
         .query_root(|app| app.inner.inner.borrow().inner.inner.inner.nonce(address))
         .await
-        .map_err(|e| BadRequest(Some(format!("{:?}", e))))?;
+        .map_err(|e| BadRequest(format!("{:?}", e)))?;
     nonce += 1;
 
     Ok(json!({
@@ -343,13 +351,13 @@ async fn txs(tx: &str) -> Result<Value, BadRequest<String>> {
         let tx: TxRequest = serde_json::from_str(tx).unwrap();
         serde_json::to_vec(&tx.tx).unwrap()
     } else {
-        base64::decode(tx).map_err(|e| BadRequest(Some(format!("{:?}", e))))?
+        base64::decode(tx).map_err(|e| BadRequest(format!("{:?}", e)))?
     };
 
     let res = client
         .broadcast_tx_commit(tx_bytes.into())
         .await
-        .map_err(|e| BadRequest(Some(format!("{:?}", e))))?;
+        .map_err(|e| BadRequest(format!("{:?}", e)))?;
 
     let tx_response = if res.check_tx.code.is_err() {
         &res.check_tx
@@ -387,15 +395,15 @@ async fn txs2(tx: &str) -> Result<Value, BadRequest<String>> {
 
     let tx_bytes = if let Some('{') = tx.chars().next() {
         let tx: TxRequest2 = serde_json::from_str(tx).unwrap();
-        base64::decode(tx.tx_bytes.as_str()).map_err(|e| BadRequest(Some(format!("{:?}", e))))?
+        base64::decode(tx.tx_bytes.as_str()).map_err(|e| BadRequest(format!("{:?}", e)))?
     } else {
-        base64::decode(tx).map_err(|e| BadRequest(Some(format!("{:?}", e))))?
+        base64::decode(tx).map_err(|e| BadRequest(format!("{:?}", e)))?
     };
 
     let res = client
         .broadcast_tx_commit(tx_bytes.into())
         .await
-        .map_err(|e| BadRequest(Some(format!("{:?}", e))))?;
+        .map_err(|e| BadRequest(format!("{:?}", e)))?;
 
     let tx_response = if res.check_tx.code.is_err() {
         &res.check_tx
@@ -445,19 +453,19 @@ async fn query(query: &str, height: Option<u32>) -> Result<String, BadRequest<St
 
     let client = tm::HttpClient::new(app_host()).unwrap();
 
-    let query_bytes = hex::decode(query).map_err(|e| BadRequest(Some(format!("{:?}", e))))?;
+    let query_bytes = hex::decode(query).map_err(|e| BadRequest(format!("{:?}", e)))?;
 
     let res = client
         .abci_query(None, query_bytes, height.map(Into::into), true)
         .await
-        .map_err(|e| BadRequest(Some(format!("{:?}", e))))?;
+        .map_err(|e| BadRequest(format!("{:?}", e)))?;
 
     let res_height: u64 = res.height.into();
     let res_height: u32 = res_height.try_into().unwrap();
 
     if let tendermint::abci::Code::Err(code) = res.code {
         let msg = format!("code {}: {}", code, res.log);
-        return Err(BadRequest(Some(msg)));
+        return Err(BadRequest(msg));
     }
 
     let res_b64 = base64::encode([res_height.to_be_bytes().to_vec(), res.value].concat());
@@ -512,7 +520,7 @@ async fn staking_delegators_delegations_2(address: &str) -> Result<Value, BadReq
     let delegations = app_client()
         .query(|app| app.staking.delegations(address))
         .await
-        .map_err(|e| BadRequest(Some(format!("{:?}", e))))?;
+        .map_err(|e| BadRequest(format!("{:?}", e)))?;
 
     let total_staked: u64 = delegations
         .iter()
@@ -749,6 +757,15 @@ async fn distribution_delegators_rewards(address: &str) -> Value {
     })
 }
 
+#[get("/cosmos/distribution/v1beta1/validators/<address>/commission")]
+async fn distribution_validator_commission(address: &str) -> Value {
+    json!({
+        "commission": {
+            "commission": []
+        }
+    })
+}
+
 #[get("/cosmos/distribution/v1beta1/delegators/<address>/rewards/<validator_address>")]
 async fn distribution_delegators_rewards_for_validator(
     address: &str,
@@ -806,7 +823,7 @@ async fn minting_inflation() -> Result<Value, BadRequest<String>> {
     let validators = app_client()
         .query(|app| app.staking.all_validators())
         .await
-        .map_err(|e| BadRequest(Some(format!("{:?}", e))))?;
+        .map_err(|e| BadRequest(format!("{:?}", e)))?;
 
     let total_staked: u64 = validators
         .iter()
@@ -816,7 +833,7 @@ async fn minting_inflation() -> Result<Value, BadRequest<String>> {
     let yearly_inflation = Decimal::from(64_682_541_340_000);
     let apr = (yearly_inflation / Decimal::from(4) / Decimal::from(total_staked))
         .result()
-        .map_err(|e| BadRequest(Some(format!("{:?}", e))))?;
+        .map_err(|e| BadRequest(format!("{:?}", e)))?;
 
     Ok(json!({ "inflation": apr.to_string() }))
 }
@@ -826,7 +843,7 @@ async fn minting_inflation_2() -> Result<Value, BadRequest<String>> {
     let validators = app_client()
         .query(|app| app.staking.all_validators())
         .await
-        .map_err(|e| BadRequest(Some(format!("{:?}", e))))?;
+        .map_err(|e| BadRequest(format!("{:?}", e)))?;
 
     let total_staked: u64 = validators
         .iter()
@@ -836,7 +853,7 @@ async fn minting_inflation_2() -> Result<Value, BadRequest<String>> {
     let yearly_inflation = Decimal::from(64_682_541_340_000);
     let apr = (yearly_inflation / Decimal::from(4) / Decimal::from(total_staked))
         .result()
-        .map_err(|e| BadRequest(Some(format!("{:?}", e))))?;
+        .map_err(|e| BadRequest(format!("{:?}", e)))?;
 
     Ok(json!({ "height": "0", "result": apr.to_string() }))
 }
@@ -874,11 +891,31 @@ async fn staking_pool() -> Value {
 }
 
 #[get("/cosmos/bank/v1beta1/supply/unom")]
-fn bank_supply_unom() -> Value {
+async fn bank_supply_unom() -> Value {
+    let supply = app_client().query(|app| app.total_supply()).await.unwrap();
+
     json!({
         "amount": {
             "denom": "unom",
-            "amount": "1"
+            "amount": supply.to_string(),
+        }
+    })
+}
+
+#[get("/cosmos/bank/v1beta1/supply")]
+async fn bank_supply() -> Value {
+    let supply = app_client().query(|app| app.total_supply()).await.unwrap();
+
+    json!({
+        "supply": [
+            {
+                "denom": "unom",
+                "amount": supply.to_string()
+            }
+        ],
+        "pagination": {
+            "next_key": null,
+            "total": "1",
         }
     })
 }
@@ -963,6 +1000,99 @@ async fn slashing_params() -> Value {
     })
 }
 
+async fn get_signing_infos() -> Vec<Value> {
+    let client = tm::HttpClient::new(app_host()).unwrap();
+
+    let all_validators: Vec<ValidatorQueryInfo> = app_client()
+        .query(|app: InnerApp| app.staking.all_validators())
+        .await
+        .unwrap();
+
+    let all_keys: Vec<_> = app_client()
+        .query(|app: InnerApp| app.staking.consensus_keys())
+        .await
+        .unwrap();
+
+    let last_signed_blocks = app_client()
+        .query(|app: InnerApp| app.staking.last_signed_blocks())
+        .await
+        .unwrap();
+
+    let latest_block_response = client.latest_block().await.unwrap();
+    let latest_block: u64 = latest_block_response.block.header.height.value();
+
+    let mut signing_infos = vec![];
+
+    for validator in all_validators {
+        let cons_key = all_keys
+            .iter()
+            .find(|entry| (**entry).0 == validator.address.into())
+            .map(|entry| (*entry).1)
+            .unwrap();
+
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(cons_key);
+        let hash = hasher.finalize().to_vec()[..20].to_vec();
+
+        let address = bech32::encode(
+            "nomicvalcons",
+            hash.to_vec().to_base32(),
+            bech32::Variant::Bech32,
+        )
+        .unwrap();
+
+        let last_signed_block: u64 = last_signed_blocks
+            .iter()
+            .find(|entry| (**entry).0 == validator.address.into())
+            .map(|entry| (*entry).1)
+            .unwrap()
+            .unwrap_or(latest_block);
+
+        let skipped_blocks: u64 = latest_block - last_signed_block;
+
+        signing_infos.push(json!({
+            "address": address,
+            "start_height": "0", // TODO: fix,
+            "index_offset": "0", // TODO: fix,
+            "jailed_until": Utc.timestamp_opt(validator.jailed_until.unwrap_or(0), 0)
+                .unwrap()
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string(),
+            "tombstoned": validator.tombstoned,
+            "missed_blocks_counter": skipped_blocks.to_string(),
+        }))
+    }
+
+    signing_infos
+}
+
+#[get("/cosmos/slashing/v1beta1/signing_infos")]
+async fn signing_infos() -> Value {
+    let signing_infos: Vec<_> = get_signing_infos().await;
+
+    json!({
+        "info": signing_infos,
+        "pagination": {
+            "next_key": null,
+            "total": signing_infos.len().to_string(),
+        }
+    })
+}
+
+#[get("/cosmos/slashing/v1beta1/signing_infos/<cons_addr>")]
+async fn signing_info(cons_addr: &str) -> Value {
+    let signing_infos: Vec<_> = get_signing_infos().await;
+
+    let signing_info = signing_infos
+        .iter()
+        .find(|value| (**value).get("address").unwrap() == cons_addr)
+        .unwrap();
+
+    json!({
+        "val_signing_info": signing_info
+    })
+}
+
 fn parse_block(res: tendermint_rpc::endpoint::block::Response) -> Value {
     let last_commit = res.block.last_commit.unwrap();
     let signatures: Vec<_> = last_commit
@@ -973,7 +1103,12 @@ fn parse_block(res: tendermint_rpc::endpoint::block::Response) -> Value {
 
             json!({
                 "validator_address": base64::encode(signature_raw.validator_address),
-                "block_id_flag": signature_raw.block_id_flag,
+                "block_id_flag": match signature_raw.block_id_flag {
+                    1 => "BLOCK_ID_FLAG_ABSENT",
+                    2 => "BLOCK_ID_FLAG_COMMIT",
+                    3 => "BLOCK_ID_FLAG_NIL",
+                    i32::MIN..=0_i32 | 4_i32..=i32::MAX => "BLOCK_ID_FLAG_UNKNOWN"
+                },
                 "timestamp": signature_raw.timestamp,
                 "signature": base64::encode(signature_raw.signature),
             })
@@ -1033,7 +1168,9 @@ async fn block(height: u32) -> Value {
 }
 
 fn parse_validator_set(res: tendermint_rpc::endpoint::validators::Response) -> Value {
-    let validators: Vec<_> = res.validators.iter()
+    let validators: Vec<_> = res
+        .validators
+        .iter()
         .map(|validator| -> Value {
             json!({
                 "address": validator.address,
@@ -1061,10 +1198,7 @@ fn parse_validator_set(res: tendermint_rpc::endpoint::validators::Response) -> V
 async fn latest_validator_set() -> Value {
     let client = tm::HttpClient::new(app_host()).unwrap();
 
-    let block = client
-        .latest_block()
-        .await
-        .unwrap();
+    let block = client.latest_block().await.unwrap();
 
     let res = client
         .validators(block.block.header.height, tendermint_rpc::Paging::All)
@@ -1125,8 +1259,7 @@ async fn ibc_connection_client_state(connection: &str) -> Value {
         })
         .await
         .unwrap()
-        .unwrap()
-        .inner;
+        .unwrap();
 
     let states: Vec<IdentifiedClientState> = app_client()
         .query(|app| app.ibc.ctx.query_client_states())
@@ -1342,6 +1475,7 @@ fn rocket() -> _ {
             staking_validator_single_delegation,
             distribution_delegators_rewards,
             distribution_delegators_rewards_for_validator,
+            distribution_validator_commission,
             minting_inflation,
             minting_inflation_2,
             staking_pool,
@@ -1350,10 +1484,13 @@ fn rocket() -> _ {
             ibc_apps_transfer_params,
             ibc_applications_transfer_params,
             bank_supply_unom,
+            bank_supply,
             validators,
             validator,
             staking_params,
             slashing_params,
+            signing_infos,
+            signing_info,
             latest_block,
             block,
             latest_validator_set,

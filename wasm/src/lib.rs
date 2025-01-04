@@ -46,8 +46,8 @@ pub async fn transfer(to_addr: String, amount: u64) -> Result<JsValue, JsError> 
     //     .map_err(|e| Error::Wasm(format!("{:?}", e)))?;
 
     // client
-    //     .pay_from(async move |mut client| client.accounts.take_as_funding(MIN_FEE.into()).await)
-    //     .accounts
+    //     .pay_from(async move |mut client|
+    // client.accounts.take_as_funding(MIN_FEE.into()).await)     .accounts
     //     .transfer(address, amount.into())
     //     .await?;
     // Ok(client.last_res()?)
@@ -430,7 +430,9 @@ pub async fn gen_deposit_addr(dest_addr: String) -> Result<DepositAddress, JsErr
         })
         .await?;
     let script = sigset.output_script(
-        Dest::Address(dest_addr).commitment_bytes()?.as_slice(),
+        Dest::NativeAccount { address: dest_addr }
+            .commitment_bytes()?
+            .as_slice(),
         threshold,
     )?;
     // TODO: get network from somewhere
@@ -495,6 +497,27 @@ pub async fn capacity_limit() -> Result<u64, JsError> {
         .await?)
 }
 
+#[wasm_bindgen(js_name = feeInfo)]
+pub async fn fee_info() -> Result<FeeInfo, JsError> {
+    let user_fee_factor = app_client()
+        .query(|app: InnerApp| Ok(app.bitcoin.checkpoints.config.user_fee_factor))
+        .await?;
+
+    Ok(app_client()
+        .query(|app: InnerApp| {
+            let building = app.bitcoin.checkpoints.building()?;
+            let est_miner_fee = building.fee_rate
+                * app.bitcoin.checkpoints.active_sigset()?.est_witness_vsize()
+                * user_fee_factor
+                / 10_000;
+            Ok(FeeInfo {
+                bridgeFeeRate: 0.015,
+                minerFeeRate: est_miner_fee,
+            })
+        })
+        .await?)
+}
+
 #[wasm_bindgen(js_name = depositsEnabled)]
 pub async fn deposits_enabled() -> Result<bool, JsError> {
     Ok(app_client()
@@ -521,7 +544,7 @@ pub async fn broadcast_deposit_addr(
         .parse()
         .map_err(|e| Error::Wasm(format!("{:?}", e)))?;
 
-    let commitment = Dest::Address(dest_addr);
+    let commitment = Dest::NativeAccount { address: dest_addr };
 
     let window = match web_sys::window() {
         Some(window) => window,
@@ -590,6 +613,62 @@ pub async fn withdraw(address: String, dest_addr: String, amount: u64) -> Result
         address,
         sdk::Msg {
             type_: "nomic/MsgWithdraw".to_string(),
+            value: value.into(),
+        },
+    )
+    .await
+}
+
+#[cfg(feature = "babylon")]
+#[wasm_bindgen(js_name = stakeNbtc)]
+pub async fn stake_nbtc(address: String, amount: u64) -> Result<String, JsError> {
+    let mut value = serde_json::Map::new();
+    value.insert("amount".to_string(), amount.to_string().into());
+    let address = address
+        .parse()
+        .map_err(|e| Error::Wasm(format!("{:?}", e)))?;
+
+    gen_call_bytes(
+        address,
+        sdk::Msg {
+            type_: "nomic/MsgStakeNbtc".to_string(),
+            value: value.into(),
+        },
+    )
+    .await
+}
+
+#[cfg(feature = "babylon")]
+#[wasm_bindgen(js_name = unstakeNbtc)]
+pub async fn unstake_nbtc(address: String, amount: u64) -> Result<String, JsError> {
+    let mut value = serde_json::Map::new();
+    value.insert("amount".to_string(), amount.to_string().into());
+    let address = address
+        .parse()
+        .map_err(|e| Error::Wasm(format!("{:?}", e)))?;
+
+    gen_call_bytes(
+        address,
+        sdk::Msg {
+            type_: "nomic/MsgUnstakeNbtc".to_string(),
+            value: value.into(),
+        },
+    )
+    .await
+}
+
+#[wasm_bindgen(js_name = payToFeePool)]
+pub async fn pay_to_fee_pool(address: String, amount: u64) -> Result<String, JsError> {
+    let mut value = serde_json::Map::new();
+    value.insert("amount".to_string(), amount.to_string().into());
+
+    let address = address
+        .parse()
+        .map_err(|e| Error::Wasm(format!("{:?}", e)))?;
+    gen_call_bytes(
+        address,
+        sdk::Msg {
+            type_: "nomic/MsgPayToFeePool".to_string(),
             value: value.into(),
         },
     )

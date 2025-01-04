@@ -16,12 +16,13 @@ use nomic::app::{InnerApp, Nom};
 use nomic::bitcoin::adapter::Adapter;
 use nomic::bitcoin::checkpoint::CheckpointStatus;
 use nomic::bitcoin::checkpoint::Config as CheckpointConfig;
+use nomic::bitcoin::deposit_index::DepositIndex;
 use nomic::bitcoin::deposit_index::{Deposit, DepositInfo};
 use nomic::bitcoin::header_queue::Config as HeaderQueueConfig;
 use nomic::bitcoin::relayer::DepositAddress;
 use nomic::bitcoin::relayer::Relayer;
 use nomic::bitcoin::signer::Signer;
-use nomic::bitcoin::threshold_sig::VersionedPubkey;
+use nomic::bitcoin::threshold_sig::Pubkey;
 use nomic::bitcoin::Config as BitcoinConfig;
 use nomic::error::{Error, Result};
 use nomic::utils::*;
@@ -46,10 +47,12 @@ use serial_test::serial;
 use std::collections::HashMap;
 use std::fs;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::sync::Once;
 use std::time::Duration;
 use tempfile::tempdir;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 
 static INIT: Once = Once::new();
 
@@ -69,7 +72,9 @@ async fn generate_deposit_address(address: &Address) -> Result<DepositAddress> {
         })
         .await?;
     let script = sigset.output_script(
-        Dest::Address(*address).commitment_bytes()?.as_slice(),
+        Dest::NativeAccount { address: *address }
+            .commitment_bytes()?
+            .as_slice(),
         threshold,
     )?;
 
@@ -90,7 +95,7 @@ pub async fn broadcast_deposit_addr(
     info!("Broadcasting deposit address to relayer...");
     let dest_addr = dest_addr.parse().unwrap();
 
-    let commitment = Dest::Address(dest_addr).encode()?;
+    let commitment = Dest::NativeAccount { address: dest_addr }.encode()?;
 
     let url = format!("{}/address", relayer,);
     let client = reqwest::Client::new();
@@ -240,7 +245,12 @@ async fn bitcoin_test() {
         max_length: 59,
         ..Default::default()
     };
-    let funded_accounts = setup_test_app(&path, 4, Some(headers_config), None, None);
+    let cp_config = CheckpointConfig {
+        emergency_disbursal_lock_time_interval: 90,
+        ..Default::default()
+    };
+    let funded_accounts =
+        setup_test_app(&path, 4, Some(headers_config), Some(cp_config), None, None);
 
     let node = Node::<nomic::app::App>::new(node_path, Some("nomic-e2e"), Default::default());
     let _node_child = node.await.run().await.unwrap();
@@ -298,6 +308,7 @@ async fn bitcoin_test() {
             vec![slashable_signer_xpriv],
             0.1,
             1.0,
+            0,
             None,
             || {
                 let wallet = DerivedKey::from_secret_key(privkey);
@@ -457,6 +468,14 @@ async fn bitcoin_test() {
         let balance = poll_for_updated_balance(funded_accounts[1].address, expected_balance).await;
         assert_eq!(balance, Amount::from(expected_balance));
 
+        app_client()
+            .with_wallet(funded_accounts[0].wallet.clone())
+            .call(
+                move |app| build_call!(app.accounts.take_as_funding((MIN_FEE).into())),
+                move |app| build_call!(app.bitcoin.transfer_to_fee_pool(8000000000.into())),
+            )
+            .await?;
+
         withdraw_bitcoin(
             &funded_accounts[0],
             bitcoin::Amount::from_sat(7000),
@@ -485,7 +504,7 @@ async fn bitcoin_test() {
             .unwrap();
         assert!(signer_jailed);
 
-        let expected_balance = 989989871600000;
+        let expected_balance = 989981871600000;
         let balance = poll_for_updated_balance(funded_accounts[0].address, expected_balance).await;
         assert_eq!(balance, Amount::from(expected_balance));
 
@@ -532,7 +551,7 @@ async fn bitcoin_test() {
                 }
             }
         }
-        assert_eq!(signatory_balance, 49986239);
+        assert_eq!(signatory_balance, 49992985);
 
         let funded_account_balances: Vec<_> = funded_accounts
             .iter()
@@ -547,7 +566,7 @@ async fn bitcoin_test() {
             })
             .collect();
 
-        let expected_account_balances: Vec<u64> = vec![989988029, 0, 0, 0];
+        let expected_account_balances: Vec<u64> = vec![989976483, 0, 0, 0];
         assert_eq!(funded_account_balances, expected_account_balances);
 
         for (i, account) in funded_accounts[0..1].iter().enumerate() {
@@ -690,8 +709,14 @@ async fn signing_completed_checkpoint_test() {
         max_offline_checkpoints: 20,
         ..Default::default()
     };
-    let funded_accounts =
-        setup_test_app(&path, 4, Some(headers_config), None, Some(bitcoin_config));
+    let funded_accounts = setup_test_app(
+        &path,
+        4,
+        Some(headers_config),
+        None,
+        Some(bitcoin_config),
+        None,
+    );
 
     info!("Starting Nomic node...");
     let node = Node::<nomic::app::App>::new(node_path, Some("nomic-e2e"), Default::default()).await;
@@ -744,6 +769,7 @@ async fn signing_completed_checkpoint_test() {
             vec![xpriv],
             0.1,
             1.0,
+            0,
             None,
             || {
                 let wallet = DerivedKey::from_secret_key(privkey);
@@ -771,6 +797,7 @@ async fn signing_completed_checkpoint_test() {
             vec![xpriv],
             0.1,
             1.0,
+            0,
             None,
             move || {
                 let wallet = DerivedKey::from_secret_key(privkey);
@@ -964,8 +991,14 @@ async fn pending_deposits() {
         min_confirmations: 3,
         ..Default::default()
     };
-    let funded_accounts =
-        setup_test_app(&path, 4, Some(headers_config), None, Some(bitcoin_config));
+    let funded_accounts = setup_test_app(
+        &path,
+        4,
+        Some(headers_config),
+        None,
+        Some(bitcoin_config),
+        None,
+    );
 
     let node = Node::<nomic::app::App>::new(node_path, Some("nomic-e2e"), Default::default());
     let node_child = node.await.run().await.unwrap();
@@ -1037,13 +1070,29 @@ async fn pending_deposits() {
         poll_for_active_sigset().await;
         poll_for_signatory_key(consensus_key).await;
 
-        deposit_bitcoin(
-            &funded_accounts[0].address,
-            bitcoin::Amount::from_btc(10.0).unwrap(),
-            &wallet,
+        let deposit_address = generate_deposit_address(&funded_accounts[0].address)
+            .await
+            .unwrap();
+        broadcast_deposit_addr(
+            funded_accounts[0].address.to_string(),
+            deposit_address.sigset_index,
+            "http://localhost:8999".to_string(),
+            deposit_address.deposit_addr.clone(),
         )
-        .await
-        .unwrap();
+        .await?;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        &wallet
+            .send_to_address(
+                &bitcoin::Address::from_str(&deposit_address.deposit_addr).unwrap(),
+                bitcoin::Amount::from_btc(10.0).unwrap(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
 
         let expected_balance = 0;
         let balance = poll_for_updated_balance(funded_accounts[0].address, expected_balance).await;
@@ -1167,7 +1216,7 @@ async fn signer_key_updating() {
         max_length: 59,
         ..Default::default()
     };
-    let funded_accounts = setup_test_app(&path, 4, Some(headers_config), None, None);
+    let funded_accounts = setup_test_app(&path, 4, Some(headers_config), None, None, None);
 
     let node = Node::<nomic::app::App>::new(node_path, Some("nomic-e2e"), Default::default());
     let _node_child = node.await.run().await.unwrap();
@@ -1214,6 +1263,7 @@ async fn signer_key_updating() {
             vec![xpriv],
             0.1,
             1.0,
+            0,
             None,
             client_provider,
             None,
@@ -1297,7 +1347,7 @@ async fn signer_key_updating() {
 
         assert_eq!(
             completed_checkpoint_0_pubkey,
-            VersionedPubkey::from(derived_public_key_0)
+            Pubkey::from(derived_public_key_0)
         );
 
         let building_checkpoint_1_pubkey = app_client()
@@ -1319,7 +1369,7 @@ async fn signer_key_updating() {
 
         assert_eq!(
             building_checkpoint_1_pubkey,
-            VersionedPubkey::from(derived_public_key_1)
+            Pubkey::from(derived_public_key_1)
         );
 
         tx.send(Some(())).await.unwrap();
@@ -1351,6 +1401,7 @@ async fn signer_key_updating() {
                 vec![new_xpriv, xpriv],
                 0.1,
                 1.0,
+                0,
                 None,
                 client_provider,
                 None,
@@ -1389,7 +1440,7 @@ async fn signer_key_updating() {
 
         assert_eq!(
             completed_checkpoint_1_pubkey,
-            VersionedPubkey::from(derived_public_key_1)
+            Pubkey::from(derived_public_key_1)
         );
 
         let building_checkpoint_2_pubkey = app_client()
@@ -1411,7 +1462,7 @@ async fn signer_key_updating() {
 
         assert_eq!(
             building_checkpoint_2_pubkey,
-            VersionedPubkey::from(derived_public_key_2)
+            Pubkey::from(derived_public_key_2)
         );
 
         deposit_bitcoin(
@@ -1442,7 +1493,7 @@ async fn signer_key_updating() {
 
         assert_eq!(
             completed_checkpoint_2_pubkey,
-            VersionedPubkey::from(derived_public_key_2)
+            Pubkey::from(derived_public_key_2)
         );
 
         Err::<(), Error>(Error::Test("Test completed successfully".to_string()))
@@ -1521,6 +1572,7 @@ async fn recover_expired_deposit() {
         4,
         Some(headers_config),
         Some(checkpoint_config),
+        None,
         None,
     );
 
@@ -1687,7 +1739,7 @@ async fn recover_expired_deposit() {
         poll_for_bitcoin_header(1185).await.unwrap();
         poll_for_completed_checkpoint(3).await;
 
-        let expected_balance = 39595129200000;
+        let expected_balance = 39596871600000;
         let balance = poll_for_updated_balance(funded_accounts[1].address, expected_balance).await;
         assert_eq!(balance, Amount::from(expected_balance));
 
@@ -1760,8 +1812,14 @@ async fn generate_deposit_expired() {
         ..Default::default()
     };
 
-    let funded_accounts =
-        setup_test_app(&path, 4, Some(headers_config), None, Some(bitcoin_config));
+    let funded_accounts = setup_test_app(
+        &path,
+        4,
+        Some(headers_config),
+        None,
+        Some(bitcoin_config),
+        None,
+    );
 
     let node = Node::<nomic::app::App>::new(node_path, Some("nomic-e2e"), Default::default());
     let node_child = node.await.run().await.unwrap();

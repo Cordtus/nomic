@@ -6,10 +6,13 @@ use super::{
     threshold_sig::{Signature, ThresholdSig},
     Xpub,
 };
-use crate::error::{Error, Result};
 use crate::{
     app::Dest,
     bitcoin::{signatory::derive_pubkey, Nbtc},
+};
+use crate::{
+    app::Identity,
+    error::{Error, Result},
 };
 use bitcoin::{blockdata::transaction::EcdsaSighashType, Sequence, Transaction, TxIn, TxOut};
 use bitcoin::{hashes::Hash, Script};
@@ -267,8 +270,12 @@ impl BitcoinTx {
 
     /// The estimated size of the transaction, including the worst-case sizes of
     /// all input witnesses once fully signed, in virtual bytes.
-    pub fn vsize(&self) -> Result<u64> {
-        Ok(self.to_bitcoin_tx()?.vsize().try_into()?)
+    pub fn est_vsize(&self) -> Result<u64> {
+        let base_vsize: u64 = self.to_bitcoin_tx()?.vsize().try_into()?;
+        let est_witness_vsize = self.input.iter()?.try_fold(0, |sum: u64, input| {
+            Ok::<_, Error>(sum + input?.est_witness_vsize)
+        })?;
+        Ok(base_vsize + est_witness_vsize)
     }
 
     /// The hash of the transaction. Note that this will change if any inputs or
@@ -281,6 +288,7 @@ impl BitcoinTx {
 
     /// The total value of the outputs in the transaction, in satoshis.
     pub fn value(&self) -> Result<u64> {
+        #[allow(clippy::manual_try_fold)]
         self.output
             .iter()?
             .fold(Ok(0), |sum: Result<u64>, out| Ok(sum? + out?.value))
@@ -432,7 +440,8 @@ impl Batch {
     }
 }
 
-/// The default fee rate to be used to pay miner fees, in satoshis per virtual byte.
+/// The default fee rate to be used to pay miner fees, in satoshis per virtual
+/// byte.
 pub const DEFAULT_FEE_RATE: u64 = 10;
 
 /// `Checkpoint` is the main structure which coordinates the network's
@@ -458,7 +467,7 @@ pub const DEFAULT_FEE_RATE: u64 = 10;
 /// "intermediate emergency disbursal transaction" (in the second batch of the
 /// `batches` deque), and one or more "final emergency disbursal transactions"
 /// (in the first batch of the `batches` deque).
-#[orga(skip(Default), version = 4)]
+#[orga(skip(Default), version = 3..=4)]
 #[derive(Debug)]
 pub struct Checkpoint {
     /// The status of the checkpoint, either `Building`, `Signing`, or
@@ -478,8 +487,7 @@ pub struct Checkpoint {
     /// disbursal.
     ///
     /// These transfers can be initiated by a simple nBTC send or by a deposit.
-    #[orga(version(V2, V3, V4))]
-    pub pending: Map<Dest, Coin<Nbtc>>,
+    pub pending: Map<(Dest, Identity), Coin<Nbtc>>,
 
     /// The fee rate to use when calculating the miner fee for the transactions
     /// in the checkpoint, in satoshis per virtual byte.
@@ -489,20 +497,17 @@ pub struct Checkpoint {
     /// faster than the target confirmation speed (implying the network is
     /// paying too low of a fee), and being decreased if checkpoints are
     /// confirmed faster than the target confirmation speed.
-    #[orga(version(V3, V4))]
     pub fee_rate: u64,
 
     /// The height of the Bitcoin block at which the checkpoint was fully signed
     /// and ready to be broadcast to the Bitcoin network, used by the fee
     /// adjustment algorithm to determine if the checkpoint was confirmed too
     /// fast or too slow.
-    #[orga(version(V3, V4))]
     pub signed_at_btc_height: Option<u32>,
 
     /// Whether or not to honor relayed deposits made against this signatory
     /// set. This can be used, for example, to enforce a cap on deposits into
     /// the system.
-    #[orga(version(V3, V4))]
     pub deposits_enabled: bool,
 
     #[orga(version(V4))]
@@ -512,37 +517,6 @@ pub struct Checkpoint {
     /// slightly older signatory sets can still be processed in this checkpoint,
     /// but the reserve output will be paid to the latest signatory set.
     pub sigset: SignatorySet,
-}
-
-impl MigrateFrom<CheckpointV0> for CheckpointV1 {
-    fn migrate_from(_value: CheckpointV0) -> OrgaResult<Self> {
-        unreachable!()
-    }
-}
-
-impl MigrateFrom<CheckpointV1> for CheckpointV2 {
-    fn migrate_from(value: CheckpointV1) -> OrgaResult<Self> {
-        Ok(Self {
-            status: value.status,
-            batches: value.batches,
-            pending: Map::new(),
-            sigset: value.sigset,
-        })
-    }
-}
-
-impl MigrateFrom<CheckpointV2> for CheckpointV3 {
-    fn migrate_from(value: CheckpointV2) -> OrgaResult<Self> {
-        Ok(Self {
-            status: value.status,
-            batches: value.batches,
-            pending: value.pending,
-            fee_rate: DEFAULT_FEE_RATE,
-            signed_at_btc_height: None,
-            sigset: value.sigset,
-            deposits_enabled: true,
-        })
-    }
 }
 
 impl MigrateFrom<CheckpointV3> for CheckpointV4 {
@@ -699,10 +673,27 @@ impl Checkpoint {
             self.batches
                 .get(BatchType::Checkpoint as u64)?
                 .unwrap()
-                .back()?
+                .front()?
                 .unwrap()
                 .to_bitcoin_tx()?,
         ))
+    }
+
+    /// Gets the transactions in the checkpoint batch, as a `Vec` of
+    /// `bitcoin::Transaction`s.
+    #[query]
+    pub fn checkpoint_txs(&self) -> Result<Vec<Adapter<bitcoin::Transaction>>> {
+        let mut txs = Vec::new();
+        for tx in self
+            .batches
+            .get(BatchType::Checkpoint as u64)?
+            .unwrap()
+            .iter()?
+        {
+            let tx = tx?;
+            txs.push(Adapter::new(tx.to_bitcoin_tx()?));
+        }
+        Ok(txs)
     }
 
     /// Gets the output containing the reserve funds for the checkpoint, the
@@ -715,7 +706,7 @@ impl Checkpoint {
         // TODO: should return None for Building checkpoints? otherwise this
         // might return a withdrawal
         let checkpoint_tx = self.checkpoint_tx()?;
-        if let Some(output) = checkpoint_tx.output.get(0) {
+        if let Some(output) = checkpoint_tx.output.first() {
             Ok(Some(output.clone()))
         } else {
             Ok(None)
@@ -844,7 +835,7 @@ impl Checkpoint {
         tx.output = self
             .additional_outputs(config, timestamping_commitment)?
             .into_iter()
-            .chain(tx.output.into_iter())
+            .chain(tx.output)
             .take(config.max_outputs as usize)
             .collect();
         tx.input.truncate(config.max_inputs as usize);
@@ -886,7 +877,7 @@ impl Checkpoint {
 }
 
 /// Configuration parameters used in processing checkpoints.
-#[orga(skip(Default), version = 3)]
+#[orga(skip(Default), version = 2..=4)]
 #[derive(Clone)]
 pub struct Config {
     /// The minimum amount of time between the creation of checkpoints, in
@@ -921,15 +912,10 @@ pub struct Config {
     /// This is used to prevent the checkpoint transaction from being too large
     /// to be accepted by the Bitcoin network.
     ///
-    /// If a checkpoint has more outputs than this when advancing from `Building`
-    /// to `Signing`, the excess outputs will be moved to the suceeding,
-    /// newly-created `Building` checkpoint.∑
+    /// If a checkpoint has more outputs than this when advancing from
+    /// `Building` to `Signing`, the excess outputs will be moved to the
+    /// suceeding, newly-created `Building` checkpoint.∑
     pub max_outputs: u64,
-
-    /// The default fee rate to use when creating the first checkpoint of the
-    /// network, in satoshis per virtual byte.
-    #[orga(version(V0))]
-    pub fee_rate: u64,
 
     /// The maximum age of a checkpoint to retain, in seconds.
     ///
@@ -945,17 +931,14 @@ pub struct Config {
     /// will be adjusted up if the checkpoint transaction is not confirmed
     /// within the target number of blocks, and will be adjusted down if the
     /// checkpoint transaction faster than the target.
-    #[orga(version(V1, V2, V3))]
     pub target_checkpoint_inclusion: u32,
 
     /// The lower bound to use when adjusting the fee rate of the checkpoint
     /// transaction, in satoshis per virtual byte.
-    #[orga(version(V1, V2, V3))]
     pub min_fee_rate: u64,
 
     /// The upper bound to use when adjusting the fee rate of the checkpoint
     /// transaction, in satoshis per virtual byte.
-    #[orga(version(V1, V2, V3))]
     pub max_fee_rate: u64,
 
     /// The value (in basis points) to multiply by when calculating the miner
@@ -965,24 +948,20 @@ pub struct Config {
     /// The difference in the fee deducted and the fee paid in the checkpoint
     /// transaction is added to the fee pool, to help the network pay for
     /// its own miner fees.
-    #[orga(version(V3))]
     pub user_fee_factor: u64,
 
     /// The threshold of signatures required to spend reserve scripts, as a
     /// ratio represented by a tuple, `(numerator, denominator)`.
     ///
     /// For example, `(9, 10)` means the threshold is 90% of the signatory set.
-    #[orga(version(V1, V2, V3))]
     pub sigset_threshold: (u64, u64),
 
     /// The minimum amount of nBTC an account must hold to be eligible for an
     /// output in the emergency disbursal.
-    #[orga(version(V1, V2, V3))]
     pub emergency_disbursal_min_tx_amt: u64,
 
     /// The amount of time between the creation of a checkpoint and when the
     /// associated emergency disbursal transactions can be spent, in seconds.
-    #[orga(version(V1, V2, V3))]
     pub emergency_disbursal_lock_time_interval: u32,
 
     /// The maximum size of a final emergency disbursal transaction, in virtual
@@ -990,7 +969,6 @@ pub struct Config {
     ///
     /// The outputs to be included in final emergency disbursal transactions
     /// will be distributed across multiple transactions around this size.
-    #[orga(version(V1, V2, V3))]
     pub emergency_disbursal_max_tx_size: u64,
 
     /// The maximum number of unconfirmed checkpoints before the network will
@@ -1006,48 +984,10 @@ pub struct Config {
     /// This will also stop the fee rate from being adjusted too high if the
     /// issue is simply with relayers failing to report the confirmation of the
     /// checkpoint transactions.
-    #[orga(version(V2, V3))]
     pub max_unconfirmed_checkpoints: u32,
-}
 
-impl MigrateFrom<ConfigV0> for ConfigV1 {
-    fn migrate_from(value: ConfigV0) -> OrgaResult<Self> {
-        Ok(Self {
-            min_checkpoint_interval: value.min_checkpoint_interval,
-            max_checkpoint_interval: value.max_checkpoint_interval,
-            max_inputs: value.max_inputs,
-            max_outputs: value.max_outputs,
-            max_age: value.max_age,
-            target_checkpoint_inclusion: ConfigV3::default().target_checkpoint_inclusion,
-            min_fee_rate: ConfigV3::default().min_fee_rate,
-            max_fee_rate: ConfigV3::default().max_fee_rate,
-            sigset_threshold: ConfigV3::default().sigset_threshold,
-            emergency_disbursal_min_tx_amt: ConfigV3::default().emergency_disbursal_min_tx_amt,
-            emergency_disbursal_lock_time_interval: ConfigV3::default()
-                .emergency_disbursal_lock_time_interval,
-            emergency_disbursal_max_tx_size: ConfigV3::default().emergency_disbursal_max_tx_size,
-        })
-    }
-}
-
-impl MigrateFrom<ConfigV1> for ConfigV2 {
-    fn migrate_from(value: ConfigV1) -> OrgaResult<Self> {
-        Ok(Self {
-            min_checkpoint_interval: value.min_checkpoint_interval,
-            max_checkpoint_interval: value.max_checkpoint_interval,
-            max_inputs: value.max_inputs,
-            max_outputs: value.max_outputs,
-            max_age: value.max_age,
-            target_checkpoint_inclusion: value.target_checkpoint_inclusion,
-            min_fee_rate: value.min_fee_rate,
-            max_fee_rate: value.max_fee_rate,
-            sigset_threshold: value.sigset_threshold,
-            emergency_disbursal_min_tx_amt: value.emergency_disbursal_min_tx_amt,
-            emergency_disbursal_lock_time_interval: value.emergency_disbursal_lock_time_interval,
-            emergency_disbursal_max_tx_size: value.emergency_disbursal_max_tx_size,
-            max_unconfirmed_checkpoints: ConfigV3::default().max_unconfirmed_checkpoints,
-        })
-    }
+    #[orga(version(V4))]
+    pub wait_to_collect_fees: bool,
 }
 
 impl MigrateFrom<ConfigV2> for ConfigV3 {
@@ -1065,7 +1005,30 @@ impl MigrateFrom<ConfigV2> for ConfigV3 {
             emergency_disbursal_min_tx_amt: value.emergency_disbursal_min_tx_amt,
             emergency_disbursal_lock_time_interval: value.emergency_disbursal_lock_time_interval,
             emergency_disbursal_max_tx_size: value.emergency_disbursal_max_tx_size,
-            ..Default::default()
+            max_unconfirmed_checkpoints: Config::default().max_unconfirmed_checkpoints,
+            user_fee_factor: Config::default().user_fee_factor,
+        })
+    }
+}
+
+impl MigrateFrom<ConfigV3> for ConfigV4 {
+    fn migrate_from(value: ConfigV3) -> OrgaResult<Self> {
+        Ok(Self {
+            min_checkpoint_interval: value.min_checkpoint_interval,
+            max_checkpoint_interval: value.max_checkpoint_interval,
+            max_inputs: value.max_inputs,
+            max_outputs: value.max_outputs,
+            max_age: value.max_age,
+            target_checkpoint_inclusion: value.target_checkpoint_inclusion,
+            min_fee_rate: value.min_fee_rate,
+            max_fee_rate: value.max_fee_rate,
+            sigset_threshold: value.sigset_threshold,
+            emergency_disbursal_min_tx_amt: value.emergency_disbursal_min_tx_amt,
+            emergency_disbursal_lock_time_interval: value.emergency_disbursal_lock_time_interval,
+            emergency_disbursal_max_tx_size: value.emergency_disbursal_max_tx_size,
+            max_unconfirmed_checkpoints: value.max_unconfirmed_checkpoints,
+            user_fee_factor: value.user_fee_factor,
+            wait_to_collect_fees: Config::default().wait_to_collect_fees,
         })
     }
 }
@@ -1076,6 +1039,8 @@ impl Config {
             min_checkpoint_interval: 15,
             emergency_disbursal_lock_time_interval: 60,
             emergency_disbursal_max_tx_size: 11,
+            user_fee_factor: 20_000,
+            max_age: 60 * 60 * 24 * 7 * 3,
             ..Config::bitcoin()
         }
     }
@@ -1090,7 +1055,7 @@ impl Config {
             target_checkpoint_inclusion: 2,
             min_fee_rate: 2, // relay threshold is 1 sat/vbyte
             max_fee_rate: 200,
-            user_fee_factor: 20000, // 2x
+            user_fee_factor: 21000, // 2.1x
             sigset_threshold: SIGSET_THRESHOLD,
             emergency_disbursal_min_tx_amt: 1000,
             #[cfg(feature = "testnet")]
@@ -1099,6 +1064,7 @@ impl Config {
             emergency_disbursal_lock_time_interval: 60 * 60 * 24 * 7 * 2, // two weeks
             emergency_disbursal_max_tx_size: 50_000,
             max_unconfirmed_checkpoints: 15,
+            wait_to_collect_fees: true,
         }
     }
 }
@@ -1107,8 +1073,7 @@ impl Default for Config {
     fn default() -> Self {
         match super::NETWORK {
             bitcoin::Network::Regtest => Config::regtest(),
-            bitcoin::Network::Testnet | bitcoin::Network::Bitcoin => Config::bitcoin(),
-            _ => unimplemented!(),
+            _ => Config::bitcoin(),
         }
     }
 }
@@ -1130,7 +1095,7 @@ impl Default for Config {
 /// broadcast to the Bitcoin network. The queue also maintains a counter
 /// (`confirmed_index`) to track which of these completed checkpoints have been
 /// confirmed in a Bitcoin block.
-#[orga(version = 2)]
+#[orga(version = 1..=2)]
 pub struct CheckpointQueue {
     /// The checkpoints in the queue, in order from oldest to newest. The last
     /// checkpoint is the checkpoint currently being built, and has the index
@@ -1149,12 +1114,6 @@ pub struct CheckpointQueue {
 
     /// Configuration parameters used in processing checkpoints.
     pub config: Config,
-}
-
-impl MigrateFrom<CheckpointQueueV0> for CheckpointQueueV1 {
-    fn migrate_from(_value: CheckpointQueueV0) -> OrgaResult<Self> {
-        unreachable!()
-    }
 }
 
 impl MigrateFrom<CheckpointQueueV1> for CheckpointQueueV2 {
@@ -1300,7 +1259,7 @@ impl<'a> BuildingCheckpointMut<'a> {
                 .get_mut(BatchType::IntermediateTx as u64)?
                 .unwrap();
             let mut intermediate_tx = intermediate_tx_batch.get_mut(0)?.unwrap();
-            let fee = intermediate_tx.vsize()? * fee_rate;
+            let fee = intermediate_tx.est_vsize()? * fee_rate;
             intermediate_tx.deduct_fee(fee)?;
             fee
         };
@@ -1363,7 +1322,9 @@ impl<'a> BuildingCheckpointMut<'a> {
                     // Deduct the final tx's miner fee from its outputs,
                     // removing any outputs which are too small to pay their
                     // share of the fee.
-                    let tx_size = tx.vsize().map_err(|err| OrgaError::App(err.to_string()))?;
+                    let tx_size = tx
+                        .est_vsize()
+                        .map_err(|err| OrgaError::App(err.to_string()))?;
                     let fee = intermediate_tx_fee / intermediate_tx_len + tx_size * fee_rate;
                     tx.deduct_fee(fee)
                         .map_err(|err| OrgaError::App(err.to_string()))?;
@@ -1441,10 +1402,11 @@ impl<'a> BuildingCheckpointMut<'a> {
                 .pending
                 .iter()?
                 .filter_map(|entry| {
-                    let (dest, coins) = match entry {
+                    let (dest_sender, coins) = match entry {
                         Err(err) => return Some(Err(err.into())),
                         Ok(entry) => entry,
                     };
+                    let (dest, _) = dest_sender.clone();
                     let script_pubkey = match dest.to_output_script(recovery_scripts) {
                         Err(err) => return Some(Err(err.into())),
                         Ok(maybe_script) => maybe_script,
@@ -1476,7 +1438,7 @@ impl<'a> BuildingCheckpointMut<'a> {
                 // and add our output there instead.
                 // TODO: don't pop and repush, just get a mutable reference
                 let mut curr_tx = final_txs.pop().unwrap();
-                if curr_tx.vsize()? >= config.emergency_disbursal_max_tx_size {
+                if curr_tx.est_vsize()? >= config.emergency_disbursal_max_tx_size {
                     self.link_intermediate_tx(&mut curr_tx, config.sigset_threshold)?;
                     final_txs.push(curr_tx);
                     curr_tx = BitcoinTx::with_lock_time(lock_time);
@@ -1584,100 +1546,147 @@ impl<'a> BuildingCheckpointMut<'a> {
         let outs = self.additional_outputs(config, &timestamping_commitment)?;
         let base_fee = self.base_fee(config, &timestamping_commitment)?;
 
-        let mut checkpoint_batch = self.batches.get_mut(BatchType::Checkpoint as u64)?.unwrap();
-        let mut checkpoint_tx = checkpoint_batch.get_mut(0)?.unwrap();
-        for out in outs.iter().rev() {
-            checkpoint_tx.output.push_front(Adapter::new(out.clone()))?;
-        }
-
-        // Remove excess inputs and outputs from the checkpoint tx, to be pushed
-        // onto the suceeding checkpoint while in its `Building` state.
-        let mut excess_inputs = vec![];
-        while checkpoint_tx.input.len() > config.max_inputs {
-            let removed_input = checkpoint_tx.input.pop_back()?.unwrap();
-            excess_inputs.push(removed_input);
-        }
-        let mut excess_outputs = vec![];
-        while checkpoint_tx.output.len() > config.max_outputs {
-            let removed_output = checkpoint_tx.output.pop_back()?.unwrap();
-            excess_outputs.push(removed_output);
-        }
-
-        // Sum the total input and output amounts.
-        // TODO: Input/Output sum functions
-        let mut in_amount = 0;
-        for i in 0..checkpoint_tx.input.len() {
-            let input = checkpoint_tx.input.get(i)?.unwrap();
-            in_amount += input.amount;
-        }
-        let mut out_amount = 0;
-        for i in 0..checkpoint_tx.output.len() {
-            let output = checkpoint_tx.output.get(i)?.unwrap();
-            out_amount += output.value;
-        }
-
-        // Deduct the outgoing amount and calculated fee amount from the reserve
-        // input amount, to set the resulting reserve output value.
-        let fee = base_fee + additional_fees;
-        let reserve_value = in_amount
-            .checked_sub(out_amount + fee)
-            .ok_or_else(|| OrgaError::App("Insufficient funds to cover fees".to_string()))?;
-        let mut reserve_out = checkpoint_tx.output.get_mut(0)?.unwrap();
-        reserve_out.value = reserve_value;
-
-        // Prepare the checkpoint tx's inputs to be signed by calculating their
-        // sighashes.
-        let bitcoin_tx = checkpoint_tx.to_bitcoin_tx()?;
-        let mut sc = bitcoin::util::sighash::SighashCache::new(&bitcoin_tx);
-        for i in 0..checkpoint_tx.input.len() {
-            let mut input = checkpoint_tx.input.get_mut(i)?.unwrap();
-            let sighash = sc.segwit_signature_hash(
-                i as usize,
-                &input.redeem_script,
-                input.amount,
-                EcdsaSighashType::All,
-            )?;
-            input.signatures.set_message(sighash.into_inner());
-        }
-
-        // Generate the emergency disbursal transactions, spending from the
-        // reserve output.
-        let reserve_outpoint = bitcoin::OutPoint {
-            txid: checkpoint_tx.txid()?,
-            vout: 0,
+        let checkpoint_outs = {
+            let mut checkpoint_batch = self.batches.get_mut(BatchType::Checkpoint as u64)?.unwrap();
+            let mut checkpoint_tx = checkpoint_batch.get_mut(0)?.unwrap();
+            for out in outs.iter().rev() {
+                checkpoint_tx.output.push_front(Adapter::new(out.clone()))?;
+            }
+            checkpoint_tx.output.len()
         };
-        self.generate_emergency_disbursal_txs(
-            nbtc_accounts,
-            recovery_scripts,
-            reserve_outpoint,
-            external_outputs,
-            self.fee_rate,
-            reserve_value,
-            config,
-        )?;
 
-        Ok((
-            reserve_outpoint,
-            reserve_value,
-            fee,
-            excess_inputs,
-            excess_outputs,
-        ))
-    }
+        // Handle other txs alongside the checkpoint tx.
+        {
+            let sigset = self.sigset.clone();
+            let fee_rate = self.fee_rate;
+            let mut checkpoint_batch = self.batches.get_mut(BatchType::Checkpoint as u64)?.unwrap();
+            for i in 1..checkpoint_batch.len() {
+                let mut tx = checkpoint_batch.get_mut(i)?.unwrap();
+                let value = tx.value()?;
 
-    /// Insert a transfer to the pending transfer queue.
-    ///
-    /// Transfers will be processed once the containing checkpoint is finished
-    /// being signed, but will be represented in this checkpoint's emergency
-    /// disbursal before they are processed.
-    pub fn insert_pending(&mut self, dest: Dest, coins: Coin<Nbtc>) -> Result<()> {
-        let mut amount = self
-            .pending
-            .remove(dest.clone())?
-            .map_or(0.into(), |c| c.amount);
-        amount = (amount + coins.amount).result()?;
-        self.pending.insert(dest, Coin::mint(amount))?;
-        Ok(())
+                // Add a funding input, to be populated once the checkpoint tx is finalized.
+                tx.input.push_back(Input::new(
+                    bitcoin::OutPoint {
+                        vout: checkpoint_outs as u32 + i as u32 - 1,
+                        ..Default::default()
+                    },
+                    &sigset,
+                    &[0],
+                    value,
+                    SIGSET_THRESHOLD,
+                )?)?;
+                let fee = tx.est_vsize()? * fee_rate;
+                tx.input.back_mut()?.unwrap().amount += fee;
+                // TODO: do accounting for fee, e.g. from fee pool
+
+                // Add the output to the checkpoint tx.
+                let out = bitcoin::TxOut {
+                    value: tx.value()?,
+                    script_pubkey: sigset.output_script(&[0], SIGSET_THRESHOLD)?,
+                };
+                checkpoint_batch
+                    .front_mut()?
+                    .unwrap()
+                    .output
+                    .push_back(Adapter::new(out))?;
+
+                // TODO: this breaks if the excess output limit is hit
+            }
+        }
+
+        let (res, checkpoint_txid) = {
+            // Remove excess inputs and outputs from the checkpoint tx, to be pushed
+            // onto the suceeding checkpoint while in its `Building` state.
+            let fee_rate = self.fee_rate;
+            let mut checkpoint_batch = self.batches.get_mut(BatchType::Checkpoint as u64)?.unwrap();
+            let mut checkpoint_tx = checkpoint_batch.get_mut(0)?.unwrap();
+            let mut excess_inputs = vec![];
+            while checkpoint_tx.input.len() > config.max_inputs {
+                let removed_input = checkpoint_tx.input.pop_back()?.unwrap();
+                excess_inputs.push(removed_input);
+            }
+            let mut excess_outputs = vec![];
+            while checkpoint_tx.output.len() > config.max_outputs {
+                let removed_output = checkpoint_tx.output.pop_back()?.unwrap();
+                excess_outputs.push(removed_output);
+            }
+
+            // Sum the total input and output amounts.
+            // TODO: Input/Output sum functions
+            let mut in_amount = 0;
+            for i in 0..checkpoint_tx.input.len() {
+                let input = checkpoint_tx.input.get(i)?.unwrap();
+                in_amount += input.amount;
+            }
+            let mut out_amount = 0;
+            for i in 0..checkpoint_tx.output.len() {
+                let output = checkpoint_tx.output.get(i)?.unwrap();
+                out_amount += output.value;
+            }
+
+            // Deduct the outgoing amount and calculated fee amount from the reserve
+            // input amount, to set the resulting reserve output value.
+            let fee = base_fee + additional_fees;
+            let reserve_value = in_amount
+                .checked_sub(out_amount + fee)
+                .ok_or_else(|| OrgaError::App("Insufficient funds to cover fees".to_string()))?;
+            let mut reserve_out = checkpoint_tx.output.get_mut(0)?.unwrap();
+            reserve_out.value = reserve_value;
+
+            // Prepare the checkpoint tx's inputs to be signed by calculating their
+            // sighashes.
+            let bitcoin_tx = checkpoint_tx.to_bitcoin_tx()?;
+            let mut sc = bitcoin::util::sighash::SighashCache::new(&bitcoin_tx);
+            for i in 0..checkpoint_tx.input.len() {
+                let mut input = checkpoint_tx.input.get_mut(i)?.unwrap();
+                let sighash = sc.segwit_signature_hash(
+                    i as usize,
+                    &input.redeem_script,
+                    input.amount,
+                    EcdsaSighashType::All,
+                )?;
+                input.signatures.set_message(sighash.into_inner());
+            }
+            drop(checkpoint_tx);
+
+            // Generate the emergency disbursal transactions, spending from the
+            // reserve output.
+            let reserve_outpoint = bitcoin::OutPoint {
+                txid: bitcoin_tx.txid(),
+                vout: 0,
+            };
+            self.generate_emergency_disbursal_txs(
+                nbtc_accounts,
+                recovery_scripts,
+                reserve_outpoint,
+                external_outputs,
+                fee_rate,
+                reserve_value,
+                config,
+            )?;
+
+            (
+                (
+                    reserve_outpoint,
+                    reserve_value,
+                    fee,
+                    excess_inputs,
+                    excess_outputs,
+                ),
+                bitcoin_tx.txid(),
+            )
+        };
+
+        // Set the outpoint txid in the inputs of any extra transactions.
+        {
+            let mut checkpoint_batch = self.batches.get_mut(BatchType::Checkpoint as u64)?.unwrap();
+            for i in 1..checkpoint_batch.len() {
+                let mut tx = checkpoint_batch.get_mut(i)?.unwrap();
+                tx.input.get_mut(0)?.unwrap().prevout.txid = checkpoint_txid;
+            }
+        }
+
+        Ok(res)
     }
 }
 
@@ -1847,10 +1856,14 @@ impl CheckpointQueue {
     /// All completed checkpoints, converted to Bitcoin transactions.
     #[query]
     pub fn completed_txs(&self, limit: u32) -> Result<Vec<Adapter<bitcoin::Transaction>>> {
-        self.completed(limit)?
+        Ok(self
+            .completed(limit)?
             .into_iter()
-            .map(|c| c.checkpoint_tx())
-            .collect()
+            .map(|c| c.checkpoint_txs())
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect())
     }
 
     /// The emergency disbursal transactions for the last completed checkpoint.
@@ -1985,7 +1998,7 @@ impl CheckpointQueue {
         fee_pool: &mut i64,
         parent_config: &super::Config,
     ) -> Result<bool> {
-        if !self.should_push(sig_keys, &timestamping_commitment)? {
+        if !self.should_push(sig_keys, &timestamping_commitment, btc_height)? {
             return Ok(false);
         }
 
@@ -2098,6 +2111,7 @@ impl CheckpointQueue {
         &mut self,
         sig_keys: &Map<ConsensusKey, Xpub>,
         timestamping_commitment: &[u8],
+        btc_height: u32,
     ) -> Result<bool> {
         // Do not push if there is a checkpoint in the `Signing` state. There
         // should only ever be at most one checkpoint in this state.
@@ -2116,6 +2130,17 @@ impl CheckpointQueue {
             // since creating the current `Building` checkpoint.
             if elapsed < self.config.min_checkpoint_interval {
                 return Ok(false);
+            }
+
+            // Do not push if Bitcoin headers are being backfilled (e.g. the
+            // current latest height is less than the height at which the last
+            // confirmed checkpoint was signed).
+            if let Ok(last_completed_index) = self.last_completed_index() {
+                let last_completed = self.get(last_completed_index)?;
+                let last_signed_height = last_completed.signed_at_btc_height.unwrap_or(0);
+                if btc_height < last_signed_height {
+                    return Ok(false);
+                }
             }
 
             // Don't push if there are no pending deposits, withdrawals, or
@@ -2139,15 +2164,17 @@ impl CheckpointQueue {
                     return Ok(false);
                 }
 
-                let miner_fee = building.base_fee(&self.config, timestamping_commitment)?
-                    + self.fee_adjustment(building.fee_rate, &self.config)?;
-                if building.fees_collected < miner_fee {
-                    log::debug!(
-                        "Not enough collected to pay miner fee: {} < {}",
-                        building.fees_collected,
-                        miner_fee,
-                    );
-                    return Ok(false);
+                if self.config.wait_to_collect_fees {
+                    let miner_fee = building.base_fee(&self.config, timestamping_commitment)?
+                        + self.fee_adjustment(building.fee_rate, &self.config)?;
+                    if building.fees_collected < miner_fee {
+                        log::debug!(
+                            "Not enough collected to pay miner fee: {} < {}",
+                            building.fees_collected,
+                            miner_fee,
+                        );
+                        return Ok(false);
+                    }
                 }
             }
         }
@@ -2396,6 +2423,19 @@ impl CheckpointQueue {
 
         Ok(())
     }
+
+    /// Returns the pending transfers for the building checkpoint.
+    ///
+    /// This query is a temporary workaround for a client iteration issue.
+    #[query]
+    pub fn pending(&self) -> Result<Vec<(Dest, Identity, u64)>> {
+        let mut pending = vec![];
+        for entry in self.building()?.pending.iter()? {
+            let (dest, coin) = entry?;
+            pending.push((dest.0.clone(), dest.1, coin.amount.into()));
+        }
+        Ok(pending)
+    }
 }
 
 /// Takes a previous fee rate and returns a new fee rate, adjusted up or down by
@@ -2419,22 +2459,16 @@ mod test {
 
     use std::{cell::RefCell, rc::Rc};
 
-    #[cfg(all(feature = "full"))]
+    #[cfg(feature = "full")]
     use bitcoin::{
         secp256k1::Secp256k1,
-        util::bip32::{ChildNumber, ExtendedPrivKey, ExtendedPubKey},
-        OutPoint, PubkeyHash, Script, Txid,
+        util::bip32::{ExtendedPrivKey, ExtendedPubKey},
+        OutPoint, Script, Txid,
     };
-    use orga::{
-        collections::EntryMap,
-        context::Context,
-        secp256k1::{PublicKey, SecretKey},
-    };
-    #[cfg(all(feature = "full"))]
-    use rand::Rng;
+    use orga::{collections::EntryMap, context::Context};
 
-    #[cfg(all(feature = "full"))]
-    use crate::bitcoin::{signatory::Signatory, threshold_sig::Share};
+    #[cfg(feature = "full")]
+    use crate::bitcoin::signatory::Signatory;
 
     use super::*;
 
@@ -2647,7 +2681,7 @@ mod test {
         let xpub = ExtendedPubKey::from_priv(&secp, &xpriv);
 
         let mut sig_keys = Map::new();
-        sig_keys.insert([0; 32], Xpub::new(xpub));
+        sig_keys.insert([0; 32], Xpub::new(xpub)).unwrap();
 
         let queue = Rc::new(RefCell::new(CheckpointQueue::default()));
         queue.borrow_mut().config = Config {
@@ -2680,7 +2714,7 @@ mod test {
                 .unwrap();
         };
         let push_deposit = || {
-            let mut input = Input::new(
+            let input = Input::new(
                 OutPoint {
                     txid: Txid::from_slice(&[0; 32]).unwrap(),
                     vout: 0,
@@ -2706,7 +2740,7 @@ mod test {
             let mut queue = queue.borrow_mut();
             let cp = queue.signing().unwrap().unwrap();
             let sigset_index = cp.sigset.index;
-            let to_sign = cp.to_sign(Xpub::new(xpub.clone())).unwrap();
+            let to_sign = cp.to_sign(Xpub::new(xpub)).unwrap();
             let secp2 = Secp256k1::signing_only();
             let sigs = crate::bitcoin::signer::sign(&secp2, &xpriv, &to_sign).unwrap();
             drop(cp);
@@ -2721,7 +2755,7 @@ mod test {
                 sign_batch(btc_height);
             }
         };
-        let confirm_cp = |index, btc_height| {
+        let confirm_cp = |index, _btc_height| {
             let mut queue = queue.borrow_mut();
             queue.confirmed_index = Some(index);
         };
@@ -2857,7 +2891,7 @@ mod test {
         let xpub = ExtendedPubKey::from_priv(&secp, &xpriv);
 
         let mut sig_keys = Map::new();
-        sig_keys.insert([0; 32], Xpub::new(xpub));
+        sig_keys.insert([0; 32], Xpub::new(xpub)).unwrap();
 
         let queue = Rc::new(RefCell::new(CheckpointQueue::default()));
         queue.borrow_mut().config = Config {
@@ -2895,7 +2929,7 @@ mod test {
                 .unwrap();
         };
         let push_deposit = || {
-            let mut input = Input::new(
+            let input = Input::new(
                 OutPoint {
                     txid: Txid::from_slice(&[0; 32]).unwrap(),
                     vout: 0,
@@ -2921,7 +2955,7 @@ mod test {
             let mut queue = queue.borrow_mut();
             let cp = queue.signing().unwrap().unwrap();
             let sigset_index = cp.sigset.index;
-            let to_sign = cp.to_sign(Xpub::new(xpub.clone())).unwrap();
+            let to_sign = cp.to_sign(Xpub::new(xpub)).unwrap();
             let secp2 = Secp256k1::signing_only();
             let sigs = crate::bitcoin::signer::sign(&secp2, &xpriv, &to_sign).unwrap();
             drop(cp);
@@ -2936,7 +2970,7 @@ mod test {
                 sign_batch(btc_height);
             }
         };
-        let confirm_cp = |index, btc_height| {
+        let confirm_cp = |index, _btc_height| {
             let mut queue = queue.borrow_mut();
             queue.confirmed_index = Some(index);
         };
@@ -2985,9 +3019,11 @@ mod test {
     }
 
     fn sigset(n: u32) -> SignatorySet {
-        let mut sigset = SignatorySet::default();
-        sigset.index = n;
-        sigset.create_time = n as u64;
+        let mut sigset = SignatorySet {
+            index: n,
+            create_time: n as u64,
+            ..Default::default()
+        };
 
         let secret = bitcoin::secp256k1::SecretKey::from_slice(&[(n + 1) as u8; 32]).unwrap();
         let pubkey: Pubkey = bitcoin::secp256k1::PublicKey::from_secret_key(
@@ -2997,7 +3033,7 @@ mod test {
         .into();
 
         sigset.signatories.push(Signatory {
-            pubkey: pubkey.into(),
+            pubkey,
             voting_power: 100,
         });
 
@@ -3009,8 +3045,10 @@ mod test {
 
     #[test]
     fn backfill_basic() {
-        let mut queue = CheckpointQueue::default();
-        queue.index = 10;
+        let mut queue = CheckpointQueue {
+            index: 10,
+            ..Default::default()
+        };
         queue
             .queue
             .push_back(Checkpoint::new(sigset(7)).unwrap())
@@ -3064,8 +3102,10 @@ mod test {
 
     #[test]
     fn backfill_with_zeroth() {
-        let mut queue = CheckpointQueue::default();
-        queue.index = 1;
+        let mut queue = CheckpointQueue {
+            index: 1,
+            ..Default::default()
+        };
         queue
             .queue
             .push_back(Checkpoint::new(sigset(1)).unwrap())

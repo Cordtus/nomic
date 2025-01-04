@@ -1,28 +1,50 @@
+//! This binary provides the command-line interface for running a Nomic full
+//! node, as well as client commands for querying and broadcasting transactions.
+
 #![feature(trivial_bounds)]
 #![allow(incomplete_features)]
 #![feature(specialization)]
 #![feature(async_closure)]
 #![feature(never_type)]
 
-use bitcoin::secp256k1;
+#[cfg(feature = "ethereum")]
+use alloy_provider::network::EthereumWallet;
+#[cfg(feature = "ethereum")]
+use alloy_signer_local::LocalSigner;
+
+use bitcoin::consensus::{Decodable, Encodable};
+#[cfg(feature = "ethereum")]
+use bitcoin::secp256k1::Message;
+use bitcoin::secp256k1::{self};
+
 use bitcoin::util::bip32::ExtendedPubKey;
+use bitcoincore_rpc_async::RpcApi;
 use bitcoincore_rpc_async::{Auth, Client as BtcClient};
 use clap::Parser;
 use nomic::app::Dest;
 use nomic::app::IbcDest;
 use nomic::app::InnerApp;
 use nomic::app::Nom;
+#[cfg(feature = "babylon")]
+use nomic::babylon;
+use nomic::bitcoin::adapter::Adapter;
+use nomic::bitcoin::matches_bitcoin_network;
+use nomic::bitcoin::signatory::SignatorySet;
 use nomic::bitcoin::Nbtc;
 use nomic::bitcoin::{relayer::Relayer, signer::Signer};
 use nomic::error::Result;
+#[cfg(feature = "ethereum")]
+use nomic::ethereum;
+#[cfg(feature = "frost")]
+use nomic::frost::{self, signer::SecretStore};
 use nomic::utils::load_bitcoin_key;
 use nomic::utils::load_or_generate;
 use orga::abci::Node;
 use orga::client::wallet::{SimpleWallet, Wallet};
 use orga::coins::{Address, Commission, Decimal, Declaration, Symbol};
 use orga::ibc::ibc_rs::core::{
-    ics24_host::identifier::{ChannelId, PortId},
-    timestamp::Timestamp,
+    host::types::identifiers::{ChannelId, PortId},
+    primitives::Timestamp,
 };
 use orga::macros::build_call;
 use orga::merk::MerkStore;
@@ -35,6 +57,8 @@ use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 use tendermint_rpc::Client as _;
 
 const BANNER: &str = r#"
@@ -46,63 +70,134 @@ const BANNER: &str = r#"
 ╚═╝  ╚═══╝  ╚═════╝  ╚═╝     ╚═╝ ╚═╝  ╚═════╝
 "#;
 
+/// Builds a wallet to be used with the client based on storing a private key in
+/// the `~/.orga-wallet` directory.
 fn wallet() -> SimpleWallet {
-    let path = home::home_dir().unwrap().join(".orga-wallet");
+    let path = std::env::var("ORGA_WALLET").unwrap_or_else(|_| {
+        home::home_dir()
+            .unwrap()
+            .join(".orga-wallet")
+            .to_str()
+            .unwrap()
+            .to_string()
+    });
     SimpleWallet::open(path).unwrap()
 }
 
+/// Returns the address associated with the default client wallet defined in
+/// [wallet].
 fn my_address() -> Address {
     wallet().address().unwrap().unwrap()
 }
 
+/// Command line options for the `nomic` binary.
 #[derive(Parser, Debug)]
 #[clap(
     version = env!("CARGO_PKG_VERSION"),
     author = "The Nomic Developers <hello@nomic.io>"
 )]
 pub struct Opts {
+    /// Top-level subcommands.
     #[clap(subcommand)]
     cmd: Command,
 
+    /// Command-line options common to all subcommands.
     #[clap(flatten)]
     config: nomic::network::Config,
 }
 
+/// Top-level subcommands for the `nomic` binary.
 #[derive(Parser, Debug)]
 pub enum Command {
+    /// Start a Nomic full node.
     Start(StartCmd),
+    /// Transfers NOM to the specified destination.
     Send(SendCmd),
+    /// Transfers nBTC to the specified destination.
     SendNbtc(SendNbtcCmd),
+    /// Shows the wallet balance.
     Balance(BalanceCmd),
+    /// Shows a list of the wallet's stake delegations.
     Delegations(DelegationsCmd),
+    /// Shows a list of all network validators.
     Validators(ValidatorsCmd),
+    /// Delegates stake to the given validator.
     Delegate(DelegateCmd),
+    /// Declares a new validator.
     Declare(DeclareCmd),
+    /// Unbonds a stake delegation.
     Unbond(UnbondCmd),
+    /// Redelegates a stake delegation to a new validator without unbonding.
     Redelegate(RedelegateCmd),
+    /// Unjails the jailed validator associated with the wallet's operator
+    /// address.
     Unjail(UnjailCmd),
+    /// Edits the description of the validator associated with the wallet's
+    /// operator address.
     Edit(EditCmd),
+    /// Claims the rewards earned by the wallet.
     Claim(ClaimCmd),
+    /// Shows the wallet's available airdrop balances which can be claimed.
     Airdrop(AirdropCmd),
+    /// Claims the airdrop balances associated with the wallet.
     ClaimAirdrop(ClaimAirdropCmd),
+    /// Relays data between the Bitcoin and Nomic networks.
     Relayer(RelayerCmd),
+    /// Signs Bitcoin transactions if the validator associated with the wallet's
+    /// operator address is in a network signatory set.
     Signer(SignerCmd),
+    /// Sets the key to use for signing Bitcoin transactions if the validator
+    /// associated with the wallet's operator address is in a network signatory
+    /// set.
     SetSignatoryKey(SetSignatoryKeyCmd),
+    /// Shows a Bitcoin address for depositing Bitcoin to the Nomic network.
     Deposit(DepositCmd),
+    /// Shows a Bitcoin address for depositing Bitcoin to a remote chain.
     InterchainDeposit(InterchainDepositCmd),
+    /// Withdraws Bitcoin from the Nomic network to a Bitcoin address.
     Withdraw(WithdrawCmd),
     // IbcDepositNbtc(IbcDepositNbtcCmd),
+    /// Withdraws nBTC from the wallet's IBC escrow account into its main nBTC
+    /// account.
     IbcWithdrawNbtc(IbcWithdrawNbtcCmd),
+    /// Runs a gRPC server for querying data from a Nomic full node.
     Grpc(GrpcCmd),
+    /// Transfers tokens to a remote IBC chain.
     IbcTransfer(IbcTransferCmd),
+    /// Dumps the application state as JSON.
     Export(ExportCmd),
+    /// Shows the status of a pending network upgrade, if any.
     UpgradeStatus(UpgradeStatusCmd),
+    /// Runs a process which scans a remote IBC chain for new validators and
+    /// broadcasts them to the Nomic network.
     RelayOpKeys(RelayOpKeysCmd),
+    /// Sets the Bitcoin recovery address for the wallet, used to recover funds
+    /// in the event of an Emergency Disbursal.
     SetRecoveryAddress(SetRecoveryAddressCmd),
+    /// Shows the network's Bitcoin checkpoint signing status.
     SigningStatus(SigningStatusCmd),
+    /// Attempts to recover a deposit which has not yet been processed by the
+    /// Nomic network by relaying a proof of its confirmation on the Bitcoin
+    /// network.
+    RecoverDeposit(RecoverDepositCmd),
+    /// Pays nBTC into the network fee pool.
+    PayToFeePool(PayToFeePoolCmd),
+    #[cfg(feature = "babylon")]
+    BabylonRelayer(BabylonRelayerCmd),
+    #[cfg(feature = "babylon")]
+    StakeNbtc(StakeNbtcCmd),
+    #[cfg(feature = "ethereum")]
+    RelayEthereum(RelayEthereumCmd),
+    #[cfg(feature = "ethereum")]
+    EthTransferNbtc(EthTransferNbtcCmd),
+    #[cfg(feature = "ethereum")]
+    GetSigsetEthAddresses(GetSigsetEthAddressesCmd),
+    #[cfg(feature = "ethereum")]
+    CreateEthConnection(CreateEthConnectionCmd),
 }
 
 impl Command {
+    /// Runs the command with the given configuration.
     fn run(&self, config: &nomic::network::Config) -> Result<()> {
         use Command::*;
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -161,41 +256,79 @@ impl Command {
                 RelayOpKeys(cmd) => cmd.run().await,
                 SetRecoveryAddress(cmd) => cmd.run().await,
                 SigningStatus(cmd) => cmd.run().await,
+                RecoverDeposit(cmd) => cmd.run().await,
+                PayToFeePool(cmd) => cmd.run().await,
+                #[cfg(feature = "babylon")]
+                BabylonRelayer(cmd) => cmd.run().await,
+                #[cfg(feature = "babylon")]
+                StakeNbtc(cmd) => cmd.run().await,
+                #[cfg(feature = "ethereum")]
+                RelayEthereum(cmd) => cmd.run().await,
+                #[cfg(feature = "ethereum")]
+                EthTransferNbtc(cmd) => cmd.run().await,
+                #[cfg(feature = "ethereum")]
+                GetSigsetEthAddresses(cmd) => cmd.run().await,
+                #[cfg(feature = "ethereum")]
+                CreateEthConnection(cmd) => cmd.run().await,
             }
         })
     }
 }
 
+/// Start a Nomic full node.
 #[derive(Parser, Clone, Debug, Serialize, Deserialize)]
 pub struct StartCmd {
     #[clap(flatten)]
     config: nomic::network::Config,
 
+    /// Display all logs output by the Tendermint node.
     #[clap(long)]
     pub tendermint_logs: bool,
+    /// Initializes a store by cloning one at the given path. The path may be
+    /// either a network home, e.g. `~/.nomic-stakenet-3`, or a store path, e.g.
+    /// `~/.nomic-stakenet-3/merk`.
     #[clap(long)]
     pub clone_store: Option<String>,
+    /// Resets the store height to 0 when initializing the node. This is useful
+    /// when cloning state from another network to initialize a new network
+    /// which is starting from genesis.
     #[clap(long)]
     pub reset_store_height: bool,
+    /// Removes all block and state data before initializing the node. Use
+    /// caution as this action cannot be undone.
     #[clap(long)]
     pub unsafe_reset: bool,
+    /// Skips the ABCI `init_chain` step when starting the node.
     #[clap(long)]
     pub skip_init_chain: bool,
+    /// Attempts to migrate the store from a legacy encoding version to the
+    /// latest encoding version.
     #[clap(long)]
     pub migrate: bool,
+    /// The path to the legacy binary to run until the on-chain network upgrade
+    /// mechanism triggers a transition to the new binary.
     #[clap(long)]
     pub legacy_home: Option<String>,
+    /// Disables changes to the validator set. This is useful for ignoring the
+    /// distribution of stake when running a local testing network.
     #[clap(long)]
     pub freeze_valset: bool,
+    /// Publicly signals onchain that the node is ready to upgrade to the
+    /// version specified by the given string.
     #[clap(long)]
     pub signal_version: Option<String>,
+    /// Copies the validator private key at the specified path to the node's
+    /// home directory when initializing.
     #[clap(long)]
     pub validator_key: Option<String>,
+    /// Copies the P2P private key at the specified path to the node's home
+    /// directory when initializing.
     #[clap(long)]
     pub node_key: Option<String>,
 }
 
 impl StartCmd {
+    /// Run the `start` command.
     async fn run(&self) -> orga::Result<()> {
         let cmd = self.clone();
         let home = cmd.config.home_expect()?;
@@ -380,6 +513,11 @@ impl StartCmd {
 }
 
 // TODO: move to config/nodehome?
+/// Returns the path to the legacy binary if it exists.
+///
+/// If the `NOMIC_LEGACY_VERSION` environment variable is set, it will be used.
+/// Otherwise, this will search for a binary with the configured legacy version
+/// in the network home's `bin` subdirectory.
 fn legacy_bin(config: &nomic::network::Config) -> Result<Option<PathBuf>> {
     let home = match config.home() {
         Some(home) => home,
@@ -418,7 +556,8 @@ fn legacy_bin(config: &nomic::network::Config) -> Result<Option<PathBuf>> {
             }
         };
 
-        // TODO: handle case where node is not initialized, but network is upgraded (can skip legacy binary)
+        // TODO: handle case where node is not initialized, but network is upgraded (can
+        // skip legacy binary)
 
         if up_to_date {
             log::debug!("Node version matches network version, no need to run legacy binary");
@@ -432,17 +571,19 @@ fn legacy_bin(config: &nomic::network::Config) -> Result<Option<PathBuf>> {
 
             #[cfg(feature = "legacy-bin")]
             {
-                if !bin_dir.exists() {
-                    std::fs::create_dir_all(&bin_dir)?;
-                }
+                if !env!("NOMIC_LEGACY_BUILD_VERSION").is_empty() {
+                    if !bin_dir.exists() {
+                        std::fs::create_dir_all(&bin_dir)?;
+                    }
 
-                let bin_name = env!("NOMIC_LEGACY_BUILD_VERSION").trim().replace(' ', "-");
-                let bin_path = bin_dir.join(bin_name);
-                let bin_bytes = include_bytes!(env!("NOMIC_LEGACY_BUILD_PATH"));
-                if !bin_path.exists() {
-                    log::debug!("Writing legacy binary to {}...", bin_path.display());
-                    std::fs::write(&bin_path, bin_bytes).unwrap();
-                    std::fs::set_permissions(bin_path, Permissions::from_mode(0o777)).unwrap();
+                    let bin_name = env!("NOMIC_LEGACY_BUILD_VERSION").trim().replace(' ', "-");
+                    let bin_path = bin_dir.join(bin_name);
+                    let bin_bytes = include_bytes!(env!("NOMIC_LEGACY_BUILD_PATH"));
+                    if !bin_path.exists() {
+                        log::debug!("Writing legacy binary to {}...", bin_path.display());
+                        std::fs::write(&bin_path, bin_bytes).unwrap();
+                        std::fs::set_permissions(bin_path, Permissions::from_mode(0o777)).unwrap();
+                    }
                 }
             }
 
@@ -508,6 +649,8 @@ fn legacy_bin(config: &nomic::network::Config) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
+/// Watches for the on-chain upgrade mechanism to signal a transition to a new
+/// version, then exits the process.
 async fn relaunch_on_migrate(config: &nomic::network::Config) -> Result<()> {
     let mut initial_ver = None;
     loop {
@@ -534,6 +677,7 @@ async fn relaunch_on_migrate(config: &nomic::network::Config) -> Result<()> {
     }
 }
 
+/// Writes changes to the network's Tendermint `config.toml` file.
 fn configure_node<P, F>(cfg_path: &P, configure: F)
 where
     P: AsRef<std::path::Path>,
@@ -550,12 +694,15 @@ where
     std::fs::write(cfg_path, toml.to_string()).expect("Failed to write config.toml");
 }
 
+/// Edits the `timeout_commit` value in the network's Tendermint `config.toml`
+/// file.
 fn edit_block_time(cfg_path: &PathBuf, timeout_commit: &str) {
     configure_node(cfg_path, |cfg| {
         cfg["consensus"]["timeout_commit"] = toml_edit::value(timeout_commit);
     });
 }
 
+/// Edits the `statesync` values in the network's Tendermint `config.toml` file.
 async fn configure_for_statesync(cfg_path: &PathBuf, rpc_servers: &[&str]) {
     log::info!("Getting bootstrap state for Tendermint light client...");
 
@@ -580,6 +727,8 @@ async fn configure_for_statesync(cfg_path: &PathBuf, rpc_servers: &[&str]) {
     });
 }
 
+/// Gets the latest block height and hash from a set of Tendermint RPC servers
+/// in order to initialize for state sync.
 async fn get_bootstrap_state(rpc_servers: &[&str]) -> Result<(i64, String)> {
     let rpc_clients: Vec<_> = rpc_servers
         .iter()
@@ -632,9 +781,14 @@ async fn get_bootstrap_state(rpc_servers: &[&str]) -> Result<(i64, String)> {
     Ok((height as i64, hash.unwrap().to_string()))
 }
 
+/// Transfers a given amount of native tokens to a given address.
 #[derive(Parser, Debug)]
 pub struct SendCmd {
+    /// The address to send the tokens to.
     to_addr: Address,
+
+    /// The amount of tokens to send (as an integer denominated in the
+    /// smallest units).
     amount: u64,
 
     #[clap(flatten)]
@@ -642,6 +796,7 @@ pub struct SendCmd {
 }
 
 impl SendCmd {
+    /// Runs the `send` command.
     async fn run(&self) -> Result<()> {
         Ok(self
             .config
@@ -655,9 +810,14 @@ impl SendCmd {
     }
 }
 
+/// Transfers a given amount of nBTC to a given address.
 #[derive(Parser, Debug)]
 pub struct SendNbtcCmd {
+    /// The address to send the tokens to.
     to_addr: Address,
+
+    /// The amount of tokens to send (as an integer denominated in the smallest
+    /// units).
     amount: u64,
 
     #[clap(flatten)]
@@ -665,6 +825,7 @@ pub struct SendNbtcCmd {
 }
 
 impl SendNbtcCmd {
+    /// Runs the `send-nbtc` command.
     async fn run(&self) -> Result<()> {
         Ok(self
             .config
@@ -678,8 +839,12 @@ impl SendNbtcCmd {
     }
 }
 
+/// Shows the balance of the given address, or the current wallet address if
+/// none is provided.
 #[derive(Parser, Debug)]
 pub struct BalanceCmd {
+    /// The address to show the balance of. If not provided, the balance of the
+    /// current wallet address is shown.
     address: Option<Address>,
 
     #[clap(flatten)]
@@ -687,6 +852,7 @@ pub struct BalanceCmd {
 }
 
 impl BalanceCmd {
+    /// Runs the `balance` command.
     async fn run(&self) -> Result<()> {
         let address = self.address.unwrap_or_else(my_address);
         println!("address: {}", address);
@@ -708,6 +874,7 @@ impl BalanceCmd {
     }
 }
 
+/// Shows the stake delegations of the current wallet address.
 #[derive(Parser, Debug)]
 pub struct DelegationsCmd {
     #[clap(flatten)]
@@ -715,6 +882,7 @@ pub struct DelegationsCmd {
 }
 
 impl DelegationsCmd {
+    /// Runs the `delegations` command.
     async fn run(&self) -> Result<()> {
         let address = my_address();
         let delegations = self
@@ -761,6 +929,7 @@ impl DelegationsCmd {
     }
 }
 
+/// Shows a list of the validators of the network.
 #[derive(Parser, Debug)]
 pub struct ValidatorsCmd {
     #[clap(flatten)]
@@ -768,6 +937,7 @@ pub struct ValidatorsCmd {
 }
 
 impl ValidatorsCmd {
+    /// Runs the `validators` command.
     async fn run(&self) -> Result<()> {
         let mut validators = self
             .config
@@ -790,9 +960,14 @@ impl ValidatorsCmd {
     }
 }
 
+/// Delegates stake to the given validator.
 #[derive(Parser, Debug)]
 pub struct DelegateCmd {
+    /// The address of the validator to delegate to.
     validator_addr: Address,
+
+    /// The amount of tokens to delegate (as an integer denominated in the
+    /// smallest units).
     amount: u64,
 
     #[clap(flatten)]
@@ -800,6 +975,7 @@ pub struct DelegateCmd {
 }
 
 impl DelegateCmd {
+    /// Runs the `delegate` command.
     async fn run(&self) -> Result<()> {
         Ok(self
             .config
@@ -817,6 +993,7 @@ impl DelegateCmd {
     }
 }
 
+/// Declares a new validator.
 #[derive(Parser, Debug)]
 pub struct DeclareCmd {
     consensus_key: String,
@@ -834,15 +1011,22 @@ pub struct DeclareCmd {
     config: nomic::network::Config,
 }
 
+/// Infomation to be posted on-chain when declaring a new validator.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeclareInfo {
+    /// The validator's name.
     pub moniker: String,
+    /// The URL of the validator's website.
     pub website: String,
+    /// The validator's Keybase fingerprint, to be used for verification and
+    /// fetching an avatar.
     pub identity: String,
+    /// Description text about the validator.
     pub details: String,
 }
 
 impl DeclareCmd {
+    /// Runs the `declare` command.
     async fn run(&self) -> Result<()> {
         let consensus_key: [u8; 32] = base64::decode(&self.consensus_key)
             .map_err(|_| orga::Error::App("invalid consensus key".to_string()))?
@@ -896,13 +1080,23 @@ impl DeclareCmd {
     }
 }
 
+/// Edits the on-chain information of a validator.
 #[derive(Parser, Debug)]
 pub struct EditCmd {
+    /// The commission rate the validator takes from rewards earned by
+    /// delegators.
     commission_rate: Decimal,
+    /// The minimum self-delegation required for the validator to remain active,
+    /// useful to guarantee to delegators that the validator has stake at risk.
     min_self_delegation: u64,
+    /// The validator's name.
     moniker: String,
+    /// The URL of the validator's website.
     website: String,
+    /// The validator's Keybase fingerprint, to be used for verification and
+    /// fetching an avatar.
     identity: String,
+    /// Description text about the validator.
     details: String,
 
     #[clap(flatten)]
@@ -910,6 +1104,7 @@ pub struct EditCmd {
 }
 
 impl EditCmd {
+    /// Runs the `edit` command.
     async fn run(&self) -> Result<()> {
         let info = DeclareInfo {
             moniker: self.moniker.clone(),
@@ -939,9 +1134,14 @@ impl EditCmd {
     }
 }
 
+/// Unbonds a validator's stake.
 #[derive(Parser, Debug)]
 pub struct UnbondCmd {
+    /// The address of the validator which the wallet is currently delegated to
+    /// which will be unbonded from.
     validator_addr: Address,
+    /// The amount of stake to unbond (as an integer denominated in the smallest
+    /// unit).
     amount: u64,
 
     #[clap(flatten)]
@@ -949,6 +1149,7 @@ pub struct UnbondCmd {
 }
 
 impl UnbondCmd {
+    /// Runs the `unbond` command.
     async fn run(&self) -> Result<()> {
         Ok(self
             .config
@@ -966,10 +1167,16 @@ impl UnbondCmd {
     }
 }
 
+/// Redelegates a validator's stake to another validator without unbonding.
 #[derive(Parser, Debug)]
 pub struct RedelegateCmd {
+    /// The address of the validator which the wallet is currently delegated to
+    /// which will be re-delegated from.
     src_validator_addr: Address,
+    /// The address of the validator which the wallet will re-delegate to.
     dest_validator_addr: Address,
+    /// The amount of stake to redelegate (as an integer denominated in the
+    /// smallest unit).
     amount: u64,
 
     #[clap(flatten)]
@@ -977,6 +1184,7 @@ pub struct RedelegateCmd {
 }
 
 impl RedelegateCmd {
+    /// Runs the `redelegate` command.
     async fn run(&self) -> Result<()> {
         Ok(self
             .config
@@ -996,6 +1204,7 @@ impl RedelegateCmd {
     }
 }
 
+/// Unjails the jailed validator associated with the wallet's operator address.
 #[derive(Parser, Debug)]
 pub struct UnjailCmd {
     #[clap(flatten)]
@@ -1003,6 +1212,7 @@ pub struct UnjailCmd {
 }
 
 impl UnjailCmd {
+    /// Runs the `unjail` command.
     async fn run(&self) -> Result<()> {
         Ok(self
             .config
@@ -1016,6 +1226,7 @@ impl UnjailCmd {
     }
 }
 
+/// Claims the rewards earned by the wallet.
 #[derive(Parser, Debug)]
 pub struct ClaimCmd {
     #[clap(flatten)]
@@ -1023,6 +1234,7 @@ pub struct ClaimCmd {
 }
 
 impl ClaimCmd {
+    /// Runs the `claim` command.
     async fn run(&self) -> Result<()> {
         Ok(self
             .config
@@ -1036,8 +1248,11 @@ impl ClaimCmd {
     }
 }
 
+/// Shows the wallet's available airdrop balances which can be claimed.
 #[derive(Parser, Debug)]
 pub struct AirdropCmd {
+    /// The address to check for airdrop eligibility. If not provided, the
+    /// current wallet address is used.
     address: Option<Address>,
 
     #[clap(flatten)]
@@ -1045,6 +1260,7 @@ pub struct AirdropCmd {
 }
 
 impl AirdropCmd {
+    /// Runs the `airdrop` command.
     async fn run(&self) -> Result<()> {
         let client = self.config.client();
 
@@ -1063,8 +1279,10 @@ impl AirdropCmd {
     }
 }
 
+/// Claims the airdrop balances associated with the wallet.
 #[derive(Parser, Debug)]
 pub struct ClaimAirdropCmd {
+    // TODO: why is this an option?
     address: Option<Address>,
 
     #[clap(flatten)]
@@ -1072,6 +1290,7 @@ pub struct ClaimAirdropCmd {
 }
 
 impl ClaimAirdropCmd {
+    /// Runs the `claim-airdrop` command.
     async fn run(&self) -> Result<()> {
         let client = self.config.client();
 
@@ -1120,24 +1339,38 @@ impl ClaimAirdropCmd {
     }
 }
 
+/// Relays data between the Bitcoin and Nomic networks.
 #[derive(Parser, Debug)]
 pub struct RelayerCmd {
+    /// The port of the local Bitcoin RPC server.
+    // TODO: get the default based on the network
     #[clap(short = 'p', long, default_value_t = 8332)]
     rpc_port: u16,
 
+    /// The username for the Bitcoin RPC server.
     #[clap(short = 'u', long)]
     rpc_user: Option<String>,
 
+    /// The password for the Bitcoin RPC server.
     #[clap(short = 'P', long)]
     rpc_pass: Option<String>,
+
+    /// The URL for the Bitcoin RPC server, e.g. http://localhost:8332.
+    #[clap(short = 'r', long, conflicts_with = "rpc-port")]
+    rpc_url: Option<String>,
 
     #[clap(flatten)]
     config: nomic::network::Config,
 }
 
 impl RelayerCmd {
+    /// Builds Bitcoin RPC client.
     async fn btc_client(&self) -> Result<BtcClient> {
-        let rpc_url = format!("http://localhost:{}", self.rpc_port);
+        let rpc_url = if let Some(rpc) = self.rpc_url.clone() {
+            rpc
+        } else {
+            format!("http://localhost:{}", self.rpc_port)
+        };
         let auth = match (self.rpc_user.clone(), self.rpc_pass.clone()) {
             (Some(user), Some(pass)) => Auth::UserPass(user, pass),
             _ => Auth::None,
@@ -1150,6 +1383,7 @@ impl RelayerCmd {
         Ok(btc_client)
     }
 
+    /// Runs the `relayer` command.
     async fn run(&self) -> Result<()> {
         let create_relayer = async || {
             let btc_client = self.btc_client().await.unwrap();
@@ -1197,13 +1431,18 @@ impl RelayerCmd {
     }
 }
 
+/// Signs Bitcoin transactions if the validator associated with the wallet's
+/// operator address is in a network signatory set.
 #[derive(Parser, Debug)]
 pub struct SignerCmd {
-    // TODO: should be a flag
-    reset_limits_at_index: Option<u32>,
-
     #[clap(flatten)]
     config: nomic::network::Config,
+
+    /// Clears the rate limiting mechanism at the given checkpoint index. This
+    /// can be used to manually override rate limiting at a certain point in
+    /// time which has been verified to be legitimate.
+    #[clap(long)]
+    reset_limits_at_index: Option<u32>,
 
     /// Limits the fraction of the total reserve that may be withdrawn within
     /// the trailing 24-hour period
@@ -1217,14 +1456,33 @@ pub struct SignerCmd {
     #[clap(long, default_value_t = 0.1)]
     max_sigset_change_rate: f64,
 
+    /// The minimum number of Bitcoin blocks that must be mined before the
+    /// signer will contribute its signature to the current signing
+    /// checkpoint. This setting can be used to change the rate at which the
+    /// network produces checkpoints (higher values cause less frequent
+    /// checkpoints).
+    ///
+    /// Signatures will always be contributed to previously completed
+    /// checkpoints.
+    #[clap(long, default_value_t = 6)]
+    min_blocks_per_checkpoint: u64,
+
+    /// The address of the Prometheus server to which metrics will be sent.
     #[clap(long)]
     prometheus_addr: Option<std::net::SocketAddr>,
 
+    /// The paths to the extended private keys used to sign Bitcoin
+    /// transactions.
+    ///
+    /// Multiple may be specified, e.g. if the node has set a new key via the
+    /// `set-signatory-key` command and the old key is still present in recent
+    /// signatory sets.
     #[clap(long)]
     xpriv_paths: Vec<PathBuf>,
 }
 
 impl SignerCmd {
+    /// Runs the `signer` command.
     async fn run(&self) -> Result<()> {
         let signer_dir_path = self.config.home_expect()?.join("signer");
         if !signer_dir_path.exists() {
@@ -1239,6 +1497,7 @@ impl SignerCmd {
             self.xpriv_paths.clone(),
             self.max_withdrawal_rate,
             self.max_sigset_change_rate,
+            self.min_blocks_per_checkpoint,
             self.reset_limits_at_index,
             // TODO: check for custom RPC port, allow config, etc
             || nomic::app_client("http://localhost:26657").with_wallet(wallet()),
@@ -1248,14 +1507,29 @@ impl SignerCmd {
 
         let relaunch = relaunch_on_migrate(&self.config);
 
-        futures::try_join!(signer, relaunch).unwrap();
+        #[cfg(feature = "frost")]
+        let frost_signer = {
+            let frost_cmd = FrostSignerCmd {
+                config: self.config.clone(),
+            };
+            frost_cmd.run()
+        };
+        #[cfg(not(feature = "frost"))]
+        let frost_signer = async { Ok(()) };
+
+        futures::try_join!(signer, relaunch, frost_signer).unwrap();
 
         Ok(())
     }
 }
 
+/// Sets the key to use for signing Bitcoin transactions if the validator
+/// associated with the wallet's operator address is in a network signatory set.
 #[derive(Parser, Debug)]
 pub struct SetSignatoryKeyCmd {
+    /// The paths to the extended private keys used to sign Bitcoin
+    /// transactions.
+    // TODO: why can we specify multiple here?
     xpriv_path: Option<PathBuf>,
 
     #[clap(flatten)]
@@ -1263,6 +1537,7 @@ pub struct SetSignatoryKeyCmd {
 }
 
 impl SetSignatoryKeyCmd {
+    /// Runs the `set-signatory-key` command.
     async fn run(&self) -> Result<()> {
         let xpriv = match self.xpriv_path.clone() {
             Some(xpriv_path) => load_bitcoin_key(xpriv_path)?,
@@ -1287,15 +1562,17 @@ impl SetSignatoryKeyCmd {
     }
 }
 
+/// Shows a Bitcoin address for depositing Bitcoin to the wallet's nBTC account
+/// on the Nomic network.
 async fn deposit(
     dest: Dest,
     client: AppClient<InnerApp, InnerApp, HttpClient, Nom, orga::client::wallet::Unsigned>,
     relayers: Vec<String>,
 ) -> Result<()> {
     if relayers.is_empty() {
-        return Err(nomic::error::Error::Orga(orga::Error::App(format!(
-            "No relayers configured, please specify at least one with --btc-relayer"
-        ))));
+        return Err(nomic::error::Error::Orga(orga::Error::App(
+            "No relayers configured, please specify at least one with --btc-relayer".to_string(),
+        )));
     }
 
     let (sigset, threshold) = client
@@ -1306,7 +1583,8 @@ async fn deposit(
             ))
         })
         .await?;
-    let script = sigset.output_script(dest.commitment_bytes()?.as_slice(), threshold)?;
+    let commitment_bytes = dest.commitment_bytes()?;
+    let script = sigset.output_script(&commitment_bytes, threshold)?;
     let btc_addr = bitcoin::Address::from_script(&script, nomic::bitcoin::NETWORK).unwrap();
 
     let mut successes = 0;
@@ -1330,9 +1608,9 @@ async fn deposit(
     }
 
     if successes < required_successes {
-        return Err(nomic::error::Error::Orga(orga::Error::App(format!(
-            "Failed to broadcast deposit address to relayers"
-        ))));
+        return Err(nomic::error::Error::Orga(orga::Error::App(
+            "Failed to broadcast deposit address to relayers".to_string(),
+        )));
     }
 
     println!("Deposit address: {}", btc_addr);
@@ -1341,31 +1619,39 @@ async fn deposit(
     Ok(())
 }
 
+/// Shows a Bitcoin address for depositing Bitcoin to the wallet's nBTC account
+/// on the Nomic network.
 #[derive(Parser, Debug)]
 pub struct DepositCmd {
-    address: Option<Address>,
+    /// The destination to deposit to. If not provided, the current wallet
+    /// address will be used.
+    dest: Option<Dest>,
 
     #[clap(flatten)]
     config: nomic::network::Config,
 }
 
 impl DepositCmd {
+    /// Runs the `deposit` command.
     async fn run(&self) -> Result<()> {
-        let dest_addr = self.address.unwrap_or_else(my_address);
+        let dest = self.dest.clone().unwrap_or_else(|| Dest::NativeAccount {
+            address: my_address(),
+        });
 
-        deposit(
-            Dest::Address(dest_addr),
-            self.config.client(),
-            self.config.btc_relayer.clone(),
-        )
-        .await
+        deposit(dest, self.config.client(), self.config.btc_relayer.clone()).await
     }
 }
 
+/// Shows a Bitcoin address for depositing Bitcoin to a remote chain.
 #[derive(Parser, Debug)]
 pub struct InterchainDepositCmd {
+    /// The destination address to deposit to (e.g. a Cosmos bech32 wallet
+    /// address).
     address: String,
+    /// The IBC channel to transfer the deposit through. Should be a string like
+    /// "channel-123".
     channel: String,
+    /// A memo to include with the deposit. This may be an empty string.
     memo: String,
 
     #[clap(flatten)]
@@ -1374,31 +1660,34 @@ pub struct InterchainDepositCmd {
 
 const ONE_DAY_NS: u64 = 86400 * 1_000_000_000;
 impl InterchainDepositCmd {
+    /// Runs the `interchain-deposit` command.
     async fn run(&self) -> Result<()> {
-        use orga::encoding::Adapter;
-        use std::time::SystemTime;
-
         let now_ns = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs()
             * 1_000_000_000;
-        let dest = Dest::Ibc(nomic::app::IbcDest {
-            source_port: "transfer".try_into().unwrap(),
-            source_channel: self.channel.clone().try_into().unwrap(),
-            sender: Adapter(my_address().to_string().into()),
-            receiver: Adapter(self.address.clone().into()),
-            timeout_timestamp: now_ns + ONE_DAY_NS,
-            memo: self.memo.clone().try_into().unwrap(),
-        });
+        let dest = Dest::Ibc {
+            data: nomic::app::IbcDest {
+                source_port: "transfer".try_into()?,
+                source_channel: self.channel.clone().try_into()?,
+                sender: my_address().to_string().try_into()?,
+                receiver: self.address.to_string().try_into()?,
+                timeout_timestamp: now_ns + ONE_DAY_NS,
+                memo: self.memo.to_string().try_into()?,
+            },
+        };
 
         deposit(dest, self.config.client(), self.config.btc_relayer.clone()).await
     }
 }
 
+/// Withdraws Bitcoin from the Nomic network to a Bitcoin address.
 #[derive(Parser, Debug)]
 pub struct WithdrawCmd {
+    /// The destination Bitcoin address to withdraw to.
     dest: bitcoin::Address,
+    /// The amount of Bitcoin to withdraw, in micro-satoshis.
     amount: u64,
 
     #[clap(flatten)]
@@ -1406,10 +1695,16 @@ pub struct WithdrawCmd {
 }
 
 impl WithdrawCmd {
+    /// Runs the `withdraw` command.
     async fn run(&self) -> Result<()> {
-        use nomic::bitcoin::adapter::Adapter;
-
         let script = self.dest.script_pubkey();
+        if !matches_bitcoin_network(&self.dest.network) {
+            return Err(nomic::error::Error::Address(format!(
+                "Invalid network for destination address. Got {}, Expected {}",
+                self.dest.network,
+                nomic::bitcoin::NETWORK
+            )));
+        }
 
         self.config
             .client()
@@ -1447,8 +1742,10 @@ impl WithdrawCmd {
 //     }
 // }
 
+/// Withdraws nBTC from the wallet's IBC escrow account into its main account.
 #[derive(Parser, Debug)]
 pub struct IbcWithdrawNbtcCmd {
+    /// The amount of nBTC to withdraw, in micro-satoshis.
     amount: u64,
 
     #[clap(flatten)]
@@ -1456,6 +1753,7 @@ pub struct IbcWithdrawNbtcCmd {
 }
 
 impl IbcWithdrawNbtcCmd {
+    /// Runs the `ibc-withdraw-nbtc` command.
     async fn run(&self) -> Result<()> {
         Ok(self
             .config
@@ -1469,24 +1767,80 @@ impl IbcWithdrawNbtcCmd {
     }
 }
 
+/// Rusns a gRPC server for querying data from a Nomic full node.
+#[cfg(feature = "ethereum")]
+#[derive(Parser, Debug)]
+pub struct EthTransferNbtcCmd {
+    to: alloy_core::primitives::Address,
+    amount: u64,
+
+    #[clap(long)]
+    eth_chainid: u32,
+
+    #[clap(long)]
+    eth_contract: String,
+
+    #[clap(flatten)]
+    config: nomic::network::Config,
+}
+
+#[cfg(feature = "ethereum")]
+impl EthTransferNbtcCmd {
+    async fn run(&self) -> Result<()> {
+        if self.eth_contract.len() != 42 || !self.eth_contract.starts_with("0x") {
+            return Err(nomic::error::Error::Address(
+                "Invalid contract address".to_string(),
+            ));
+        }
+        let contract_addr_vec = hex::decode(&self.eth_contract[2..]).unwrap(); // TODO
+        let mut contract_addr = [0; 20];
+        contract_addr.copy_from_slice(&contract_addr_vec[..]);
+        let contract_addr = Address::from(contract_addr);
+
+        let to = self.to.0 .0.into();
+        Ok(self
+            .config
+            .client()
+            .with_wallet(wallet())
+            .call(
+                |app| {
+                    build_call!(app.eth_transfer_nbtc(
+                        self.eth_chainid,
+                        contract_addr,
+                        to,
+                        self.amount.into()
+                    ))
+                },
+                |app| build_call!(app.app_noop()),
+            )
+            .await?)
+    }
+}
+
 #[derive(Parser, Debug)]
 pub struct GrpcCmd {
-    #[clap(default_value_t = 9001)]
+    /// The port to listen on.
+    #[clap(long, default_value_t = 9001)]
     port: u16,
+    #[clap(long, default_value = "127.0.0.1")]
+    host: String,
 
     #[clap(flatten)]
     config: nomic::network::Config,
 }
 
 impl GrpcCmd {
+    /// Runs the `grpc` command.
     async fn run(&self) -> Result<()> {
         use orga::ibc::GrpcOpts;
-        std::panic::set_hook(Box::new(|_| {}));
+        std::panic::set_hook(Box::new(|e| {
+            log::error!("{}", e.to_string());
+        }));
+        log::info!("Starting gRPC server on {}:{}", self.host, self.port);
         orga::ibc::start_grpc(
-            // TODO: support configuring RPC address
-            || nomic::app_client("http://localhost:26657").sub(|app| app.ibc.ctx),
+            || self.config.client().sub(|app| Ok(app.ibc.ctx)),
             &GrpcOpts {
-                host: "127.0.0.1".to_string(),
+                host: self.host.to_string(),
                 port: self.port,
                 chain_id: self.config.chain_id.clone().unwrap(),
             },
@@ -1497,22 +1851,32 @@ impl GrpcCmd {
     }
 }
 
+/// Transfers nBTC to a remote chain using IBC.
 #[derive(Parser, Debug)]
 pub struct IbcTransferCmd {
+    /// The address of the receiver on the remote chain (e.g. a Cosmos bech32
+    /// wallet address).
     receiver: String,
+    /// The amount of nBTC to transfer, in micro-satoshis.
     amount: u64,
+    /// The IBC channel to transfer through. Should be a string like
+    /// "channel-123".
     channel_id: ChannelId,
+    /// The IBC port to transfer through. This is usually a string like
+    /// "transfer".
     port_id: PortId,
+    /// A memo to attach to the transfer. This can be an empty string.
     memo: String,
+    /// The number of seconds in which the transfer must be completed before
+    /// becoming invalid.
     timeout_seconds: u64,
     #[clap(flatten)]
     config: nomic::network::Config,
 }
 
 impl IbcTransferCmd {
+    /// Runs the `ibc-transfer` command.
     async fn run(&self) -> Result<()> {
-        use orga::encoding::Adapter as EdAdapter;
-
         let my_address = my_address();
         let amount = self.amount;
         let now_ns = Timestamp::now().nanoseconds();
@@ -1521,10 +1885,10 @@ impl IbcTransferCmd {
         let ibc_dest = IbcDest {
             source_port: self.port_id.to_string().try_into()?,
             source_channel: self.channel_id.to_string().try_into()?,
-            receiver: EdAdapter(self.receiver.clone().into()),
-            sender: EdAdapter(my_address.to_string().into()),
+            receiver: self.receiver.to_string().try_into()?,
+            sender: my_address.to_string().try_into()?,
             timeout_timestamp,
-            memo: self.memo.clone().try_into()?,
+            memo: self.memo.to_string().try_into()?,
         };
 
         Ok(self
@@ -1539,6 +1903,7 @@ impl IbcTransferCmd {
     }
 }
 
+/// Outputs the current network application state as JSON.
 #[derive(Parser, Debug)]
 pub struct ExportCmd {
     #[clap(flatten)]
@@ -1546,6 +1911,7 @@ pub struct ExportCmd {
 }
 
 impl ExportCmd {
+    /// Runs the `export` command.
     async fn run(&self) -> Result<()> {
         let home = self.config.home_expect()?;
 
@@ -1564,6 +1930,7 @@ impl ExportCmd {
     }
 }
 
+/// Shows the status of a pending network upgrade, if any.
 #[derive(Parser, Debug)]
 pub struct UpgradeStatusCmd {
     #[clap(flatten)]
@@ -1571,6 +1938,7 @@ pub struct UpgradeStatusCmd {
 }
 
 impl UpgradeStatusCmd {
+    /// Runs the `upgrade-status` command.
     async fn run(&self) -> Result<()> {
         use orga::coins::staking::ValidatorQueryInfo;
         use orga::coins::VersionedAddress;
@@ -1685,7 +2053,7 @@ impl UpgradeStatusCmd {
         let mut entries = validator_names.iter().collect::<Vec<_>>();
         entries.sort_by(|(_, (_, a)), (_, (_, b))| b.cmp(a));
 
-        println!("");
+        println!();
         println!("Upgraded:");
         for (addr, (name, power)) in entries.iter() {
             let cons_key = consensus_keys.get(addr).unwrap();
@@ -1697,7 +2065,7 @@ impl UpgradeStatusCmd {
                 );
             }
         }
-        println!("");
+        println!();
         println!("Not upgraded:");
         for (addr, (name, power)) in entries.iter() {
             let cons_key = consensus_keys.get(addr).unwrap();
@@ -1709,7 +2077,7 @@ impl UpgradeStatusCmd {
                 );
             }
         }
-        println!("");
+        println!();
 
         println!(
             "Upgrade has been signaled by {:.2}% of voting power",
@@ -1748,13 +2116,19 @@ impl UpgradeStatusCmd {
     }
 }
 
+/// Runs a process which scans a remote IBC chain for new validators and
+/// broadcasts them to the Nomic network. This is used to populate the remote
+/// chain's Emergency Disbursal multisig wallet.
 #[derive(Parser, Debug)]
 pub struct RelayOpKeysCmd {
+    /// The ID of the IBC client which is connected to the remote chain.
     client_id: String,
+    /// The URL of the remote chain's Tendermint RPC server.
     rpc_url: String,
 }
 
 impl RelayOpKeysCmd {
+    /// Runs the `relay-op-keys` command.
     async fn run(&self) -> Result<()> {
         use nomic::cosmos::relay_op_keys;
         log::info!("Relaying operator keys for client {}", self.client_id);
@@ -1773,8 +2147,14 @@ impl RelayOpKeysCmd {
     }
 }
 
+/// Sets the Bitcoin recovery address for the wallet, used to recover funds in
+/// the event of an Emergency Disbursal.
+///
+/// If an Emergency Disbursal happens, the nBTC held in the wallet's account
+/// will be automatically paid to this recovery address.
 #[derive(Parser, Debug)]
 pub struct SetRecoveryAddressCmd {
+    /// The Bitcoin address to set as the recovery address.
     address: bitcoin::Address,
 
     #[clap(flatten)]
@@ -1782,8 +2162,17 @@ pub struct SetRecoveryAddressCmd {
 }
 
 impl SetRecoveryAddressCmd {
+    /// Runs the `set-recovery-address` command.
     async fn run(&self) -> Result<()> {
         let script = self.address.script_pubkey();
+        if !matches_bitcoin_network(&self.address.network) {
+            return Err(nomic::error::Error::Address(format!(
+                "Invalid network for recovery address. Got {}, Expected {}",
+                self.address.network,
+                nomic::bitcoin::NETWORK
+            )));
+        }
+
         Ok(self
             .config
             .client()
@@ -1800,6 +2189,7 @@ impl SetRecoveryAddressCmd {
     }
 }
 
+/// Shows the network's Bitcoin checkpoint signing status.
 #[derive(Parser, Debug)]
 pub struct SigningStatusCmd {
     #[clap(flatten)]
@@ -1807,6 +2197,7 @@ pub struct SigningStatusCmd {
 }
 
 impl SigningStatusCmd {
+    /// Runs the `signing-status` command.
     async fn run(&self) -> Result<()> {
         use bitcoin::util::bip32::ChildNumber;
         let home = self.config.home_expect()?;
@@ -1831,8 +2222,8 @@ impl SigningStatusCmd {
             .inner
             .inner;
         let Some(signing) = app.bitcoin.checkpoints.signing()? else {
-           println!("No signing checkpoint");
-           return Ok(())
+            println!("No signing checkpoint");
+            return Ok(());
         };
         let batch = signing.current_batch()?.unwrap();
         let mut lowest_index = 0;
@@ -1891,6 +2282,913 @@ impl SigningStatusCmd {
     }
 }
 
+/// Attempts to recover a deposit which has not yet been processed by the
+/// Nomic network by relaying proof of its confirmation on the Bitcoin
+/// network.
+///
+/// This command is useful when a deposit has been made to the network and
+/// confirmed on Bitcoin, but has not yet been relayed.
+#[derive(Parser, Debug)]
+pub struct RecoverDepositCmd {
+    /// The port of the Bitcoin RPC server.
+    // TODO: get default based on network
+    #[clap(short = 'p', long, default_value_t = 8332)]
+    rpc_port: u16,
+    /// The username for the Bitcoin RPC server.
+    #[clap(short = 'u', long)]
+    rpc_user: Option<String>,
+    /// The password for the Bitcoin RPC server.
+    #[clap(short = 'P', long)]
+    rpc_pass: Option<String>,
+
+    /// The IBC channel ID (e.g. "channel-123") which the deposit was sent to,
+    /// if it is an interchain deposit.
+    #[clap(long)]
+    channel: Option<String>,
+    /// The remote address the deposit was made to, if it is an interchain
+    /// deposit.
+    ///
+    /// For convenience, the `--remote-prefix` flag can be used instead
+    /// to derive the remote address from the current wallet's address.
+    #[clap(long)]
+    remote_addr: Option<String>,
+    /// The remote prefix of the deposit address (e.g. "osmo"), if it is an
+    /// interchain deposit. The remote address will be derived from the current
+    /// wallet's address but with the given prefix.
+    ///
+    /// If the remote address is not based on the current wallet's address, use
+    /// the `--remote-addr` flag instead.
+    #[clap(long)]
+    remote_prefix: Option<String>,
+
+    /// The Nomic bech32 wallet address associated with the deposit.
+    #[clap(long)]
+    nomic_addr: Address,
+    /// The Bitcoin address to the deposit was made to.
+    #[clap(long)]
+    deposit_addr: bitcoin::Address,
+    /// The Bitcoin block hash the deposit transaction was confirmed in.
+    #[clap(long)]
+    block_hash: bitcoin::BlockHash,
+    /// The Bitcoin transaction ID of the deposit transaction.
+    #[clap(long)]
+    txid: bitcoin::Txid,
+    /// The output index within the deposit transaction, associated with the
+    /// output which deposits to the Nomic signatory set.
+    #[clap(long)]
+    vout: u32,
+
+    /// The path to a file containing the indexes and reserve scripts of
+    /// signatories to search. This can be generated with the
+    /// `get-reserve-scripts` binary.
+    #[clap(long)]
+    reserve_script_path: PathBuf,
+
+    #[clap(flatten)]
+    config: nomic::network::Config,
+}
+
+impl RecoverDepositCmd {
+    /// Builds a Bitcoin RPC client.
+    async fn btc_client(&self) -> Result<BtcClient> {
+        let rpc_url = format!("http://localhost:{}", self.rpc_port);
+        let auth = match (self.rpc_user.clone(), self.rpc_pass.clone()) {
+            (Some(user), Some(pass)) => Auth::UserPass(user, pass),
+            _ => Auth::None,
+        };
+
+        let btc_client = BtcClient::new(rpc_url, auth)
+            .await
+            .map_err(|e| orga::Error::App(e.to_string()))?;
+
+        Ok(btc_client)
+    }
+
+    /// Relays a deposit to the Nomic network.
+    async fn relay_deposit(&self, dest: Dest, sigset_index: u32) -> Result<()> {
+        let nomic_client = self.config.client();
+        let btc_client = self.btc_client().await?;
+
+        let block_height = btc_client.get_block_info(&self.block_hash).await?.height as u32;
+
+        let tx = btc_client
+            .get_raw_transaction(&self.txid, Some(&self.block_hash))
+            .await?;
+
+        let proof_bytes = btc_client
+            .get_tx_out_proof(&[tx.txid()], Some(&self.block_hash))
+            .await?;
+        let proof = ::bitcoin::MerkleBlock::consensus_decode(&mut proof_bytes.as_slice())?.txn;
+        {
+            let mut tx_bytes = vec![];
+            tx.consensus_encode(&mut tx_bytes)?;
+            let tx = ::bitcoin::Transaction::consensus_decode(&mut tx_bytes.as_slice())?;
+            let tx = Adapter::new(tx);
+            let proof = Adapter::new(proof);
+
+            let dest2 = dest.clone();
+            nomic_client
+                .call(
+                    move |app| {
+                        build_call!(app.relay_deposit(
+                            tx,
+                            block_height,
+                            proof,
+                            self.vout,
+                            sigset_index,
+                            dest2
+                        ))
+                    },
+                    |app| build_call!(app.app_noop()),
+                )
+                .await?;
+        }
+
+        log::info!(
+            "Relayed deposit: {} sats, {:?}",
+            tx.output[self.vout as usize].value,
+            dest
+        );
+
+        Ok(())
+    }
+
+    /// Runs the `recover-deposit` command.
+    async fn run(&self) -> Result<()> {
+        let mut remote_addr = self.remote_addr.clone();
+        if let Some(remote_prefix) = &self.remote_prefix {
+            let data = bech32::decode(&self.nomic_addr.to_string()).unwrap().1;
+            remote_addr =
+                Some(bech32::encode(remote_prefix, data, bech32::Variant::Bech32).unwrap());
+        }
+
+        if self.channel.is_some() != remote_addr.is_some() {
+            return Err(nomic::error::Error::Orga(orga::Error::App(
+                "Both --channel and --remote-prefix or --remote-addr must be specified".to_string(),
+            )));
+        }
+
+        let threshold = self
+            .config
+            .client()
+            .query(|app| Ok(app.bitcoin.checkpoints.config.sigset_threshold))
+            .await?;
+
+        // TODO: support passing in script csv by path
+        let sigsets: Vec<(u32, SignatorySet)> = std::fs::read_to_string(&self.reserve_script_path)?
+            .lines()
+            .map(|line| {
+                let mut split = line.split(',');
+                (split.next().unwrap(), split.next().unwrap())
+            })
+            .map(|(i, script_hex)| {
+                let i = i.parse::<u32>().unwrap();
+                let script = bitcoin::Script::from(hex::decode(script_hex).unwrap());
+                let (sigset, _) = SignatorySet::from_script(&script, threshold).unwrap();
+                (i, sigset)
+            })
+            .collect();
+
+        dbg!(sigsets.len());
+
+        if let (Some(channel), Some(remote_addr)) = (self.channel.as_ref(), remote_addr.as_ref()) {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let start = (now + 60 * 60 * 24 * 7 - (now % (60 * 60))) * 1_000_000_000;
+            let mut dest = Dest::Ibc {
+                data: IbcDest {
+                    source_port: "transfer".to_string().try_into()?,
+                    source_channel: channel.to_string().try_into()?,
+                    receiver: remote_addr.to_string().try_into()?,
+                    sender: self.nomic_addr.to_string().try_into()?,
+                    timeout_timestamp: start,
+                    memo: "".to_string().try_into()?,
+                },
+            };
+
+            dbg!(&dest);
+
+            let mut i = 0;
+            // TODO: support legacy encoding
+            let mut dest_bytes = dest.commitment_bytes().unwrap();
+            loop {
+                for (sigset_index, sigset) in sigsets.iter() {
+                    if i % 10_000 == 0 {
+                        if let Dest::Ibc { data: dest } = &dest {
+                            println!("{} {}", i, dest.timeout_timestamp);
+                        } else {
+                            unreachable!()
+                        }
+                    }
+
+                    let script = sigset.output_script(&dest_bytes, threshold).unwrap();
+                    let addr =
+                        bitcoin::Address::from_script(&script, nomic::bitcoin::NETWORK).unwrap();
+                    if addr.to_string().to_lowercase()
+                        == self.deposit_addr.to_string().to_lowercase()
+                    {
+                        if let Dest::Ibc { data: ibc_dest } = &dest {
+                            println!(
+                                "Found at sigset index {}, timeout_timestamp {}",
+                                sigset_index, ibc_dest.timeout_timestamp,
+                            );
+                        } else {
+                            unreachable!()
+                        }
+
+                        return self.relay_deposit(dest, *sigset_index).await;
+                    }
+
+                    i += 1;
+                }
+
+                if let Dest::Ibc { data: ibc_dest } = &mut dest {
+                    ibc_dest.timeout_timestamp -= 60 * 60 * 1_000_000_000;
+                    // TODO: support legacy encoding
+                    dest_bytes = dest.commitment_bytes().unwrap();
+                } else {
+                    unreachable!()
+                }
+            }
+        }
+
+        let dest = Dest::NativeAccount {
+            address: self.nomic_addr,
+        };
+        // TODO: support legacy encoding
+        let dest_bytes = dest.commitment_bytes().unwrap();
+
+        for (sigset_index, sigset) in sigsets.iter() {
+            let script = sigset.output_script(&dest_bytes, threshold).unwrap();
+            let addr = bitcoin::Address::from_script(&script, nomic::bitcoin::NETWORK).unwrap();
+            if addr.to_string().to_lowercase() == self.deposit_addr.to_string().to_lowercase() {
+                println!("Found at sigset index {}", sigset_index,);
+                return self.relay_deposit(dest, *sigset_index).await;
+            }
+        }
+
+        Err(nomic::error::Error::Orga(orga::Error::App(
+            "Deposit address not found in any sigset".to_string(),
+        )))
+    }
+}
+
+/// Pays nBTC into the network fee pool.
+#[derive(Parser, Debug)]
+pub struct PayToFeePoolCmd {
+    /// The amount of nBTC to pay into the fee pool, in micro-satoshis.
+    amount: u64,
+
+    #[clap(flatten)]
+    config: nomic::network::Config,
+}
+
+impl PayToFeePoolCmd {
+    /// Runs the `pay-to-fee-pool` command.
+    async fn run(&self) -> Result<()> {
+        Ok(self
+            .config
+            .client()
+            .with_wallet(wallet())
+            .call(
+                |app| build_call!(app.bitcoin.transfer_to_fee_pool(self.amount.into())),
+                |app| build_call!(app.app_noop()),
+            )
+            .await?)
+    }
+}
+
+#[cfg(feature = "babylon")]
+#[derive(Parser, Debug)]
+pub struct BabylonRelayerCmd {
+    #[clap(short = 'p', long, default_value_t = 8332)]
+    rpc_port: u16,
+    #[clap(short = 'u', long)]
+    rpc_user: Option<String>,
+    #[clap(short = 'P', long)]
+    rpc_pass: Option<String>,
+
+    // TODO: babylon rpc
+    #[clap(flatten)]
+    config: nomic::network::Config,
+}
+
+#[cfg(feature = "babylon")]
+impl BabylonRelayerCmd {
+    async fn btc_client(&self) -> Result<BtcClient> {
+        let rpc_url = format!("http://localhost:{}", self.rpc_port);
+        let auth = match (self.rpc_user.clone(), self.rpc_pass.clone()) {
+            (Some(user), Some(pass)) => Auth::UserPass(user, pass),
+            _ => Auth::None,
+        };
+
+        let btc_client = BtcClient::new(rpc_url, auth)
+            .await
+            .map_err(|e| orga::Error::App(e.to_string()))?;
+
+        Ok(btc_client)
+    }
+
+    async fn run(&self) -> Result<()> {
+        let app_client = self.config.client();
+        let btc_client = self.btc_client().await?;
+
+        let staking_confs = async {
+            loop {
+                babylon::relayer::relay_staking_confs(&app_client, &btc_client).await?;
+
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+
+            #[allow(unreachable_code)]
+            Ok::<_, nomic::error::Error>(())
+        };
+
+        let unbonding_confs = async {
+            loop {
+                babylon::relayer::relay_unbonding_confs(&app_client, &btc_client).await?;
+
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+
+            #[allow(unreachable_code)]
+            Ok::<_, nomic::error::Error>(())
+        };
+
+        futures::try_join!(staking_confs, unbonding_confs)?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "babylon")]
+#[derive(Parser, Debug)]
+pub struct StakeNbtcCmd {
+    amount: u64,
+
+    #[clap(flatten)]
+    config: nomic::network::Config,
+}
+
+#[cfg(feature = "babylon")]
+impl StakeNbtcCmd {
+    async fn run(&self) -> Result<()> {
+        todo!()
+        // Ok(self
+        //     .config
+        //     .client()
+        //     .with_wallet(wallet())
+        //     .call(
+        //         |app| build_call!(app.pay_nbtc_fee()),
+        //         |app| build_call!(app.stake_nbtc((self.amount).into())),
+        //     )
+        //     .await?)
+    }
+}
+
+#[cfg(feature = "frost")]
+#[derive(Parser, Debug)]
+pub struct FrostSignerCmd {
+    #[clap(flatten)]
+    config: nomic::network::Config,
+}
+
+#[cfg(feature = "frost")]
+impl FrostSignerCmd {
+    async fn run(&self) -> Result<()> {
+        let signer_dir_path = self.config.home_expect()?.join("frost");
+        if !signer_dir_path.exists() {
+            std::fs::create_dir(&signer_dir_path)?;
+        }
+        let store = SecretStore::new_store(signer_dir_path);
+        let mut signer = crate::frost::signer::Signer::new(
+            store,
+            || self.config.client().with_wallet(wallet()),
+            my_address(),
+        );
+        loop {
+            signer.step().await?;
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+    }
+}
+
+#[cfg(feature = "ethereum")]
+#[derive(Parser, Debug)]
+pub struct RelayEthereumCmd {
+    #[clap(long)]
+    private_key: String, // TODO: use type that validates length, format (optional 0x)
+
+    // TODO: support multiple connections
+    #[clap(long)]
+    eth_rpc_url: String,
+    #[clap(long)]
+    beacon_api_url: String,
+    #[clap(long)]
+    eth_chainid: u32,
+    #[clap(long)]
+    eth_contract: String,
+
+    #[clap(flatten)]
+    config: nomic::network::Config,
+}
+
+#[cfg(feature = "ethereum")]
+impl RelayEthereumCmd {
+    async fn run(&self) -> Result<()> {
+        let mut privkey_hex = self.private_key.as_str();
+        if privkey_hex.starts_with("0x") {
+            privkey_hex = &privkey_hex[2..];
+        }
+        let privkey = hex::decode(privkey_hex).unwrap(); // TODO
+        if privkey.len() != 32 {
+            return Err(nomic::error::Error::Orga(orga::Error::App(
+                "Invalid private key".to_string(),
+            )));
+        }
+
+        if !self.eth_contract.starts_with("0x") {
+            return Err(nomic::error::Error::Orga(orga::Error::App(
+                "Invalid contract address".to_string(),
+            )));
+        }
+        if self.eth_contract.len() != 42 {
+            return Err(nomic::error::Error::Orga(orga::Error::App(
+                "Invalid contract address".to_string(),
+            )));
+        }
+        let bridge_contract_vec = hex::decode(&self.eth_contract[2..]).unwrap();
+        let mut bridge_contract = [0u8; 20];
+        bridge_contract.copy_from_slice(&bridge_contract_vec);
+        let bridge_contract = Address::from(bridge_contract);
+
+        let try_relay_msg = || async {
+            let client = self.config.clone().client();
+            let token_contract = client
+                .query(|app| {
+                    Ok(app
+                        .ethereum
+                        .token_contract(self.eth_chainid, bridge_contract)?)
+                })
+                .await?;
+
+            let signer = LocalSigner::from_slice(privkey.as_slice()).unwrap(); // TODO
+            let wallet = EthereumWallet::new(signer);
+            let provider = alloy_provider::ProviderBuilder::new()
+                .with_recommended_fillers()
+                .wallet(wallet)
+                .on_http(self.eth_rpc_url.parse().unwrap());
+            let contract = nomic::ethereum::bridge_contract::new(
+                alloy_core::primitives::Address::from_slice(&bridge_contract.bytes()),
+                provider,
+            );
+
+            let msg_index: u64 = contract
+                .state_lastEventNonce()
+                .call()
+                .await
+                .unwrap()
+                ._0
+                .to();
+            dbg!(msg_index);
+
+            let Some((msg, sigs, data)) = client
+                .query(|app| {
+                    if app
+                        .ethereum
+                        .message_index(self.eth_chainid, bridge_contract)?
+                        < msg_index
+                    {
+                        return Ok(None);
+                    }
+
+                    if !app
+                        .ethereum
+                        .signed(self.eth_chainid, bridge_contract, msg_index)?
+                    {
+                        log::debug!("Message {msg_index} is still being signed");
+                        return Ok(None);
+                    }
+
+                    Ok(Some(app.ethereum.msd(
+                        self.eth_chainid,
+                        bridge_contract,
+                        msg_index,
+                    )?))
+                })
+                .await?
+            else {
+                return Ok(());
+            };
+
+            let (ss_index, valset_index) = client
+                .query(|app| {
+                    for i in 1..msg_index {
+                        let (_, _, args) =
+                            app.ethereum
+                                .msd(self.eth_chainid, bridge_contract, msg_index - i)?;
+                        if let nomic::ethereum::OutMessageArgs::UpdateValset(
+                            valset_index,
+                            ref valset,
+                        ) = args
+                        {
+                            return Ok((valset.index, valset_index));
+                        }
+                    }
+
+                    Ok((0, 0))
+                })
+                .await?;
+            let mut valset = client
+                .query(|app| Ok(app.bitcoin.checkpoints.get(ss_index)?.sigset.clone()))
+                .await?;
+            valset.normalize_vp(u32::MAX as u64);
+
+            let sigs: Vec<_> = sigs
+                .into_iter()
+                .map(|(pk, sig)| {
+                    let Some(sig) = sig else {
+                        return nomic::ethereum::bridge_contract::Signature {
+                            v: 0,
+                            r: [0; 32].into(),
+                            s: [0; 32].into(),
+                        };
+                    };
+                    let (v, r, s) = nomic::ethereum::to_eth_sig(
+                        &bitcoin::secp256k1::ecdsa::Signature::from_compact(&sig.0).unwrap(),
+                        &bitcoin::secp256k1::PublicKey::from_slice(pk.as_slice()).unwrap(),
+                        &Message::from_slice(&msg).unwrap(),
+                    );
+                    nomic::ethereum::bridge_contract::Signature {
+                        v,
+                        r: r.into(),
+                        s: s.into(),
+                    }
+                })
+                .collect();
+
+            match data {
+                nomic::ethereum::OutMessageArgs::Batch {
+                    transfers,
+                    timeout,
+                    batch_index,
+                } => {
+                    dbg!(contract
+                        .submitBatch(
+                            valset.to_abi(valset_index),
+                            sigs,
+                            transfers
+                                .iter()
+                                .map(|t| alloy_core::primitives::U256::from(t.amount))
+                                .collect(),
+                            transfers
+                                .iter()
+                                .map(|t| alloy_core::primitives::Address::from_slice(
+                                    &t.dest.bytes()
+                                ))
+                                .collect(),
+                            transfers
+                                .iter()
+                                .map(|t| alloy_core::primitives::U256::from(t.fee_amount))
+                                .collect(),
+                            alloy_core::primitives::U256::from(batch_index),
+                            alloy_core::primitives::Address::from_slice(&token_contract.bytes()),
+                            alloy_core::primitives::U256::from(timeout),
+                        )
+                        .send()
+                        .await
+                        .unwrap()
+                        .get_receipt()
+                        .await
+                        .unwrap());
+                }
+                nomic::ethereum::OutMessageArgs::ContractCall {
+                    contract_address,
+                    data,
+                    max_gas,
+                    fallback_address,
+                    transfer_amount,
+                    fee_amount,
+                    message_index,
+                } => {
+                    contract
+                        .submitLogicCall(
+                            valset.to_abi(valset_index),
+                            sigs,
+                            nomic::ethereum::logic_call_args(
+                                transfer_amount,
+                                fee_amount,
+                                token_contract.into(),
+                                contract_address,
+                                data.as_slice(),
+                                max_gas,
+                                fallback_address,
+                                message_index,
+                            ),
+                        )
+                        .send()
+                        .await
+                        .unwrap()
+                        .get_receipt()
+                        .await
+                        .unwrap();
+                }
+                nomic::ethereum::OutMessageArgs::UpdateValset(index, new_valset) => {
+                    dbg!(contract
+                        .updateValset(new_valset.to_abi(index), valset.to_abi(valset_index), sigs)
+                        .send()
+                        .await
+                        .unwrap()
+                        .get_receipt()
+                        .await
+                        .unwrap());
+                }
+            };
+
+            Ok::<_, nomic::error::Error>(())
+        };
+
+        let try_relay_return = || async {
+            let client = self
+                .config
+                .clone()
+                .client()
+                .with_wallet(SimpleWallet::open(".").unwrap());
+
+            let signer = LocalSigner::from_slice(privkey.as_slice()).unwrap(); // TODO
+            let wallet = EthereumWallet::new(signer);
+            let provider = alloy_provider::ProviderBuilder::new()
+                .with_recommended_fillers()
+                .wallet(wallet)
+                .on_http(self.eth_rpc_url.parse().unwrap());
+            let contract = nomic::ethereum::bridge_contract::new(
+                alloy_core::primitives::Address::from_slice(&bridge_contract.bytes()),
+                provider.clone(),
+            );
+            let bridge_contract_addr =
+                alloy_core::primitives::Address::from_slice(&bridge_contract.bytes());
+
+            let has_contract_index = !contract
+                .state_lastReturnNonce()
+                .call_raw()
+                .await
+                .unwrap()
+                .is_empty();
+            if !has_contract_index {
+                dbg!("No return nonce");
+                return Ok(());
+            }
+
+            let contract_index: u64 = contract
+                .state_lastReturnNonce()
+                .call()
+                .await
+                .unwrap()
+                ._0
+                .to();
+            let nomic_index = client
+                .query(|app| {
+                    Ok(app
+                        .ethereum
+                        .return_index(self.eth_chainid, bridge_contract)?)
+                })
+                .await?;
+
+            if nomic_index == contract_index {
+                return Ok(());
+            }
+            dbg!(contract_index, nomic_index);
+
+            let dest_str = contract
+                .state_returnDests(alloy_core::primitives::U256::from(nomic_index))
+                .call()
+                .await
+                .unwrap()
+                ._0;
+            let amount: u64 = contract
+                .state_returnAmounts(alloy_core::primitives::U256::from(nomic_index))
+                .call()
+                .await
+                .unwrap()
+                ._0
+                .to();
+            let sender = contract
+                .state_returnSenders(alloy_core::primitives::U256::from(nomic_index))
+                .call()
+                .await
+                .unwrap()
+                ._0;
+            dbg!(&dest_str, amount, sender);
+
+            let block_number = self
+                .config
+                .client()
+                .query(|app| Ok(app.ethereum.block_number(self.eth_chainid)?))
+                .await?;
+
+            log::debug!(
+                "Getting state proof... (chainid={}, block_number={})",
+                self.eth_chainid,
+                block_number
+            );
+
+            let state_proof = ethereum::relayer::get_state_proof(
+                &provider,
+                bridge_contract_addr,
+                nomic_index,
+                block_number,
+            )
+            .await?;
+
+            self.config
+                .client()
+                .with_wallet(crate::wallet())
+                .call(
+                    move |app| {
+                        build_call!(app.ethereum.relay_return(
+                            self.eth_chainid,
+                            bridge_contract,
+                            state_proof.clone()
+                        ))
+                    },
+                    |app| build_call!(app.app_noop()),
+                )
+                .await?;
+
+            Ok::<_, nomic::error::Error>(())
+        };
+
+        let try_relay_consensus = || async {
+            let client = self.config.clone().client();
+
+            let rpc_client =
+                ethereum::consensus::relayer::RpcClient::new(self.beacon_api_url.clone());
+            // TODO: use chain_id in closure without breaking fn coercion
+            let lc = client.sub(move |app: InnerApp| Ok(app.ethereum.light_client(11155111)?));
+            let updates = ethereum::consensus::relayer::get_updates(&lc, &rpc_client).await?;
+            dbg!(updates.len());
+
+            for update in updates {
+                log::info!(
+                    "Relaying Ethereum consensus update... (chainid={}, slot={})",
+                    11155111, // TODO: self.eth_chainid,
+                    update.finalized_header.beacon.slot
+                );
+                self.config
+                    .client()
+                    .call(
+                        move |app| {
+                            build_call!(app
+                                .ethereum
+                                .relay_consensus_update(self.eth_chainid, update.clone()))
+                        },
+                        |app| build_call!(app.app_noop()),
+                    )
+                    .await?;
+
+                log::info!("Consensus update relayed.");
+            }
+
+            Ok::<_, nomic::error::Error>(())
+        };
+
+        let relay_msgs = async {
+            loop {
+                if let Err(e) = try_relay_msg().await {
+                    log::error!("Ethereum relayer error: {:?}", e);
+                };
+
+                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            }
+
+            #[allow(unreachable_code)]
+            Ok::<_, nomic::error::Error>(())
+        };
+
+        let relay_returns = async {
+            loop {
+                if let Err(e) = try_relay_return().await {
+                    log::error!("Nomic relayer error: {:?}", e);
+                };
+
+                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            }
+
+            #[allow(unreachable_code)]
+            Ok::<_, nomic::error::Error>(())
+        };
+
+        let relay_consensus = async {
+            loop {
+                if let Err(e) = try_relay_consensus().await {
+                    log::error!("Nomic relayer error: {:?}", e);
+                };
+
+                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            }
+
+            #[allow(unreachable_code)]
+            Ok::<_, nomic::error::Error>(())
+        };
+
+        futures::try_join!(relay_msgs, relay_returns, relay_consensus)?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "ethereum")]
+#[derive(Parser, Debug)]
+pub struct GetSigsetEthAddressesCmd {
+    #[clap(default_value = "0")]
+    sigset_index: u32,
+
+    #[clap(flatten)]
+    config: nomic::network::Config,
+}
+
+#[cfg(feature = "ethereum")]
+impl GetSigsetEthAddressesCmd {
+    async fn run(&self) -> Result<()> {
+        let client = self.config.client();
+
+        let sigset = client
+            .query(|app| {
+                Ok(app
+                    .bitcoin
+                    .checkpoints
+                    .get(self.sigset_index)?
+                    .sigset
+                    .clone())
+            })
+            .await?;
+
+        print!("[");
+        for (i, addr) in sigset.eth_addresses().into_iter().enumerate() {
+            print!(
+                "{}{}",
+                if i > 0 { "," } else { "" },
+                hex::encode(addr.bytes()),
+            );
+        }
+        println!("]");
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "ethereum")]
+#[derive(Parser, Debug)]
+pub struct CreateEthConnectionCmd {
+    #[clap(long)]
+    eth_chainid: u32,
+    #[clap(long)]
+    bridge_contract_addr: String,
+    #[clap(long)]
+    token_contract_addr: String,
+    #[clap(long)]
+    sigset_index: u32,
+
+    #[clap(flatten)]
+    config: nomic::network::Config,
+}
+
+#[cfg(feature = "ethereum")]
+impl CreateEthConnectionCmd {
+    async fn run(&self) -> Result<()> {
+        let client = self.config.client().with_wallet(wallet());
+
+        let bc_vec = hex::decode(&self.bridge_contract_addr).unwrap();
+        let mut bc_bytes = [0u8; 20];
+        bc_bytes.copy_from_slice(&bc_vec);
+        let bridge_contract = Address::from(bc_bytes);
+
+        let tc_vec = hex::decode(&self.token_contract_addr).unwrap();
+        let mut tc_bytes = [0u8; 20];
+        tc_bytes.copy_from_slice(&tc_vec);
+        let token_contract = Address::from(tc_bytes);
+
+        client
+            .call(
+                move |app| {
+                    build_call!(app.eth_create_connection(
+                        self.eth_chainid,
+                        bridge_contract,
+                        token_contract,
+                        self.sigset_index
+                    ))
+                },
+                |app| build_call!(app.app_noop()),
+            )
+            .await?;
+
+        Ok(())
+    }
+}
+
+/// The entry point to the Nomic command line interface.
 pub fn main() {
     if std::env::var("NOMIC_LOG_SIMPLE").is_ok() {
         pretty_env_logger::formatted_builder()

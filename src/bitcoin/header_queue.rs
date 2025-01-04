@@ -13,7 +13,7 @@ use orga::prelude::*;
 use orga::Error as OrgaError;
 use orga::Result as OrgaResult;
 
-const MAX_LENGTH: u64 = 4032;
+const MAX_LENGTH: u64 = 24_192; // ~6 months
 const MAX_RELAY: u64 = 250;
 const MAX_TIME_INCREASE: u32 = 2 * 60 * 60;
 const RETARGET_INTERVAL: u32 = 2016;
@@ -250,7 +250,7 @@ impl Default for Config {
             bitcoin::Network::Bitcoin => Config::mainnet(),
             bitcoin::Network::Testnet => Config::testnet(),
             bitcoin::Network::Regtest => Config::regtest(),
-            _ => unimplemented!(),
+            bitcoin::Network::Signet => Config::signet(),
         }
     }
 }
@@ -300,6 +300,28 @@ impl Config {
         }
     }
 
+    pub fn signet() -> Self {
+        let checkpoint_json = include_str!("./signet_checkpoint.json");
+        let checkpoint: (u32, BlockHeader) = serde_json::from_str(checkpoint_json).unwrap();
+        let (height, header) = checkpoint;
+
+        let mut header_bytes = vec![];
+        header.consensus_encode(&mut header_bytes).unwrap();
+
+        Self {
+            max_length: MAX_LENGTH,
+            max_time_increase: MAX_TIME_INCREASE,
+            retarget_interval: RETARGET_INTERVAL,
+            target_spacing: TARGET_SPACING,
+            target_timespan: TARGET_TIMESPAN,
+            max_target: 0x1e0377ae,
+            trusted_height: height,
+            encoded_trusted_header: header_bytes.try_into().unwrap(),
+            retargeting: true,
+            min_difficulty_blocks: false,
+        }
+    }
+
     pub fn regtest() -> Self {
         let checkpoint_json = include_str!("./testnet_checkpoint.json");
         let checkpoint: (u32, BlockHeader) = serde_json::from_str(checkpoint_json).unwrap();
@@ -338,7 +360,7 @@ impl Config {
 pub struct HeaderQueue {
     pub(crate) deque: Deque<WorkHeader>,
     pub(crate) current_work: Adapter<Uint256>,
-    config: Config,
+    pub(crate) config: Config,
 }
 
 impl MigrateFrom<HeaderQueueV0> for HeaderQueueV1 {
@@ -689,8 +711,8 @@ impl HeaderQueue {
     /// If the header queue does not contain a header at the passed height,
     /// `None` will be returned.
     ///
-    /// If the passed height is less than the initial height of the header queue,
-    /// an error will be returned.
+    /// If the passed height is less than the initial height of the header
+    /// queue, an error will be returned.
     #[query]
     pub fn get_by_height(&self, height: u32) -> Result<Option<WorkHeader>> {
         let initial_height = match self.deque.front()? {

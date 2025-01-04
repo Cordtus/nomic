@@ -72,8 +72,9 @@ pub struct Signer<W, F> {
     xprivs: Vec<ExtendedPrivKey>,
     max_withdrawal_rate: f64,
     max_sigset_change_rate: f64,
+    min_blocks_per_checkpoint: u64,
     reset_index: Option<u32>,
-    app_client: F,
+    pub app_client: F,
     exporter_addr: Option<SocketAddr>,
     _phantom: PhantomData<W>,
 }
@@ -82,6 +83,7 @@ impl<W: Wallet, F> Signer<W, F>
 where
     F: Fn() -> AppClient<InnerApp, InnerApp, HttpClient, Nom, W>,
 {
+    #![allow(clippy::too_many_arguments)]
     /// Create a new signer, loading the extended private key from the given
     /// path (`key_path`) if it exists. If the key does not exist, one will be
     /// generated and written to the path, then submitted to the chain, becoming
@@ -93,14 +95,16 @@ where
     /// - `key_path`: The path to the file containing the extended private key,
     ///   or where it should be written if it does not yet exist.
     /// - `max_withdrawal_rate`: The maximum rate at which Bitcoin can be
-    /// withdrawn from the reserve in a 24-hour period, temporarily halting
-    /// signing if the limit is reached.
+    ///   withdrawn from the reserve in a 24-hour period, temporarily halting
+    ///   signing if the limit is reached.
     /// - `max_sigset_change_rate`: The maximum rate at which the signatory set
-    /// can change in a 24-hour period, temporarily halting signing if the limit
-    /// is reached.
+    ///   can change in a 24-hour period, temporarily halting signing if the
+    ///   limit is reached.
+    /// - `min_checkpoint_seconds`: The minimum amount of time that must pass
+    ///   before this signer will contribute its signature.
     /// - `reset_index`: A checkpoint index at which the rate limits should be
-    /// reset, used to manually override the limits if the signer has checked on
-    /// the pending withdrawals and decided they are legitimate.
+    ///   reset, used to manually override the limits if the signer has checked
+    ///   on the pending withdrawals and decided they are legitimate.
     /// - `app_client`: A function that returns a new app client to be used in
     ///   querying and submitting calls.
     #[allow(clippy::too_many_arguments)]
@@ -110,6 +114,7 @@ where
         xpriv_paths: Vec<P>,
         max_withdrawal_rate: f64,
         max_sigset_change_rate: f64,
+        min_checkpoint_seconds: u64,
         reset_index: Option<u32>,
         app_client: F,
         exporter_addr: Option<SocketAddr>,
@@ -134,6 +139,7 @@ where
             xprivs,
             max_withdrawal_rate,
             max_sigset_change_rate,
+            min_checkpoint_seconds,
             reset_index,
             app_client,
             exporter_addr,
@@ -144,24 +150,27 @@ where
     ///
     /// **Parameters:**
     /// - `op_addr`: The operator address of the submitter. Used to check if the
-    ///  operator has already submitted a signatory key.
-    /// - `xpriv`: The extended private key to use for signing.
+    ///   operator has already submitted a signatory key.
+    /// - `xprivs`: The extended private keys to use for signing.
     /// - `max_withdrawal_rate`: The maximum rate at which Bitcoin can be
-    /// withdrawn from the reserve in a 24-hour period, temporarily halting
-    /// signing if the limit is reached.
+    ///   withdrawn from the reserve in a 24-hour period, temporarily halting
+    ///   signing if the limit is reached.
     /// - `max_sigset_change_rate`: The maximum rate at which the signatory set
-    /// can change in a 24-hour period, temporarily halting signing if the limit
-    /// is reached.
+    ///   can change in a 24-hour period, temporarily halting signing if the
+    ///   limit is reached.
+    /// - `min_blocks_per_checkpoint`: The minimum number of new Bitcoin blocks
+    ///   that must be mined before this signer will contribute its signature.
     /// - `reset_index`: A checkpoint index at which the rate limits should be
-    /// reset, used to manually override the limits if the signer has checked on
-    /// the pending withdrawals and decided they are legitimate.
+    ///   reset, used to manually override the limits if the signer has checked
+    ///   on the pending withdrawals and decided they are legitimate.
     /// - `app_client`: A function that returns a new app client to be used in
-    ///  querying and submitting calls.
+    ///   querying and submitting calls.
     pub fn new(
         op_addr: Address,
         xprivs: Vec<ExtendedPrivKey>,
         max_withdrawal_rate: f64,
         max_sigset_change_rate: f64,
+        min_blocks_per_checkpoint: u64,
         reset_index: Option<u32>,
         app_client: F,
         exporter_addr: Option<SocketAddr>,
@@ -174,6 +183,7 @@ where
             xprivs,
             max_withdrawal_rate,
             max_sigset_change_rate,
+            min_blocks_per_checkpoint,
             reset_index,
             app_client,
             exporter_addr,
@@ -223,8 +233,15 @@ where
         }
 
         let checkpoint_signing = self.start_checkpoint_signing(key_pairs.clone());
-        let recovery_signing = self.start_recovery_signing(key_pairs);
-        try_join!(checkpoint_signing, recovery_signing)?;
+        let recovery_signing = self.start_recovery_signing(key_pairs.clone());
+
+        let eth_signing = async {
+            #[cfg(feature = "ethereum")]
+            self.start_ethereum_signing(key_pairs).await?;
+            Ok(())
+        };
+
+        try_join!(checkpoint_signing, recovery_signing, eth_signing)?;
 
         Ok(())
     }
@@ -298,7 +315,7 @@ where
     }
 
     /// Get a new app client.
-    fn client(&self) -> AppClient<InnerApp, InnerApp, HttpClient, Nom, W> {
+    pub fn client(&self) -> AppClient<InnerApp, InnerApp, HttpClient, Nom, W> {
         (self.app_client)()
     }
 
@@ -322,7 +339,7 @@ where
 
         let (status, timestamp) = self
             .client()
-            .query(|app| {
+            .query(|app: InnerApp| {
                 let cp = app.bitcoin.checkpoints.get(index)?;
                 Ok((cp.status, cp.create_time()))
             })
@@ -344,8 +361,39 @@ where
             return Ok(matches!(status, CheckpointStatus::Complete));
         }
 
-        self.check_change_rates().await?;
-        info!("Signing checkpoint ({} inputs)...", to_sign.len());
+        if matches!(status, CheckpointStatus::Signing) {
+            self.check_change_rates().await?;
+            let current_btc_height = self
+                .client()
+                .query(|app: InnerApp| Ok(app.bitcoin.headers.height()?))
+                .await? as u64;
+            let last_signed_btc_height: Option<u64> = self
+                .client()
+                .query(|app: InnerApp| {
+                    Ok(app
+                        .bitcoin
+                        .checkpoints
+                        .get(index.saturating_sub(1))?
+                        .signed_at_btc_height)
+                })
+                .await?
+                .map(|v| v as u64);
+
+            if let Some(last_signed_btc_height) = last_signed_btc_height {
+                if current_btc_height < last_signed_btc_height + self.min_blocks_per_checkpoint {
+                    let delta = last_signed_btc_height + self.min_blocks_per_checkpoint
+                        - current_btc_height;
+                    info!(
+                        "Checkpoint is too recent, {} more Bitcoin block{} required",
+                        delta,
+                        if delta == 1 { "" } else { "s" },
+                    );
+                    return Ok(false);
+                }
+            }
+        }
+
+        info!("Signing Bitcoin checkpoint ({} inputs)...", to_sign.len());
 
         let sigs = sign(&secp, xpriv, &to_sign)?;
 
@@ -358,7 +406,7 @@ where
 
         SIG_BATCH_COUNTER.inc();
         SIG_COUNTER.inc_by(to_sign.len() as u64);
-        info!("Submitted signatures");
+        info!("Submitted Bitcoin signatures");
 
         Ok(false)
     }
@@ -487,13 +535,14 @@ mod test {
             Vec::default(),
             1.0,
             1.0,
+            0,
             None,
             || app_client("http://localhost:26657"),
             None,
         )
         .unwrap();
 
-        assert!(signer.xprivs.get(0).unwrap() == &xpriv);
+        assert!(signer.xprivs.first().unwrap() == &xpriv);
     }
 
     #[test]
@@ -512,13 +561,14 @@ mod test {
             vec![temp_dir.path().join("xpriv-primary")],
             1.0,
             1.0,
+            0,
             None,
             || app_client("http://localhost:26657"),
             None,
         )
         .unwrap();
         assert!(signer.xprivs.len() == 1);
-        assert!(signer.xprivs.get(0).unwrap() == &xpriv);
+        assert!(signer.xprivs.first().unwrap() == &xpriv);
     }
 
     #[test]
@@ -531,6 +581,7 @@ mod test {
             vec![temp_dir.path().join("xpriv-primary")],
             1.0,
             1.0,
+            0,
             None,
             || app_client("http://localhost:26657"),
             None,
@@ -557,6 +608,7 @@ mod test {
             xpriv_paths,
             1.0,
             1.0,
+            0,
             None,
             || app_client("http://localhost:26657"),
             None,

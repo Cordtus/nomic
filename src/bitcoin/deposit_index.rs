@@ -1,25 +1,19 @@
-use crate::error::Result;
+use crate::{app::Dest, error::Result};
 use bitcoin::{Address, Txid};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Deposit {
-    txid: Txid,
-    vout: u32,
-    amount: u64,
-    height: Option<u64>,
-}
-
-impl Deposit {
-    pub fn new(txid: Txid, vout: u32, amount: u64, height: Option<u64>) -> Self {
-        Self {
-            txid,
-            vout,
-            amount,
-            height,
-        }
-    }
+    pub txid: Txid,
+    pub vout: u32,
+    pub amount: u64,
+    pub height: Option<u64>,
+    pub sigset_index: u32,
+    pub miner_fee_rate: f64,
+    pub bridge_fee_rate: f64,
+    pub dest: Dest,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -30,7 +24,7 @@ pub struct DepositInfo {
 
 type ReceiverIndex = HashMap<String, HashMap<Address, HashMap<(Txid, u32), Deposit>>>;
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct DepositIndex {
     pub receiver_index: ReceiverIndex,
 }
@@ -48,9 +42,9 @@ impl DepositIndex {
     ) {
         self.receiver_index
             .entry(receiver)
-            .or_insert_with(HashMap::new)
+            .or_default()
             .entry(address)
-            .or_insert_with(HashMap::new)
+            .or_default()
             .insert((deposit.txid, deposit.vout), deposit);
     }
 
